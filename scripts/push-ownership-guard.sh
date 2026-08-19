@@ -137,7 +137,13 @@ _pog_read_with_retry() {
 #      an unrelated in-progress bead, e.g. one correctly held open for its
 #      own merge-tracking, was blocking pushes for a completely different
 #      deploy/*-gate branch because path 2 took .[0] of the match list
-#      unconditionally).
+#      unconditionally). This single-match requirement applies to EVERY
+#      branch shape that falls through to the fallback, not only
+#      deploy/*-gate — a non-gate branch that encodes no bead id and a
+#      session holding 2+ in-progress beads now resolves to nothing and is
+#      not checked at all. Deliberate: .[0] of an unordered multi-match was
+#      never sound enforcement in either direction. Pinned by
+#      test_bead_id_general_branch_ignores_ambiguous_inprogress_beads.
 # If both resolve and disagree, the branch match wins (it's the more
 # specific signal) and a warning goes to stderr — this is a best-effort
 # cross-check, not a hard failure, since branch-naming habits can
