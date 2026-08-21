@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/dispatch"
 	"github.com/gastownhall/gascity/internal/events"
@@ -2184,32 +2185,35 @@ func TestHookClaimSkipsMessageBeadsAheadOfRoutedWork(t *testing.T) {
 	}
 }
 
-// Workflow roots, scope latches, and formula spec sidecars are graph topology,
-// not executable work. They may still appear in a broad work_query and may
-// retain an assignee or route. None of the existing-assignment,
-// ready-assignment, or fresh-claim tiers may return them to a worker.
-func TestHookClaimSkipsWorkflowTopologyAheadOfRoutedWork(t *testing.T) {
-	const (
-		identity = "builder"
-		workID   = "ga-real-work"
-	)
+// A graph.v2 workflow root is a claimable launch/continuation anchor even
+// though the worker must not execute or close the root itself. Rejecting the
+// root after the pool demand query has counted it makes the reconciler spawn a
+// worker that can never accept the work, producing a wake/drain loop.
+func TestHookClaimClaimsRoutedGraphWorkflowRoot(t *testing.T) {
+	const identity = "builder"
+	const rootID = "ga-workflow-root"
 	runner := func(string, string) (string, error) {
-		return `[
-			{"id":"ga-root","status":"in_progress","assignee":"` + identity + `","metadata":{"gc.kind":"workflow","gc.formula_contract":"graph.v2","gc.routed_to":"` + identity + `"}},
-			{"id":"ga-scope","status":"open","assignee":"` + identity + `","metadata":{"gc.kind":"scope","gc.routed_to":"` + identity + `"}},
-			{"id":"ga-spec","status":"open","assignee":"","metadata":{"gc.kind":"spec","gc.routed_to":"` + identity + `"}},
-			{"id":"` + workID + `","status":"open","issue_type":"task","assignee":"","metadata":{"gc.routed_to":"` + identity + `"}}
-		]`, nil
+		return `[{"id":"` + rootID + `","status":"open","issue_type":"task","assignee":"","metadata":{"gc.kind":"workflow","gc.formula_contract":"graph.v2","gc.routed_to":"` + identity + `"}}]`, nil
 	}
 	claimed := false
 	ops := hookClaimOps{
 		Runner: runner,
 		Claim: func(_ context.Context, _ string, _ []string, id, assignee string) (beads.Bead, bool, error) {
-			if id != workID {
-				t.Fatalf("store.Claim called for topology bead %q; want executable work %q", id, workID)
+			if id != rootID {
+				t.Fatalf("store.Claim called for %q; want workflow root %q", id, rootID)
 			}
 			claimed = true
-			return beads.Bead{ID: id, Status: "in_progress", Assignee: assignee, Type: "task"}, true, nil
+			return beads.Bead{
+				ID:       id,
+				Status:   "in_progress",
+				Assignee: assignee,
+				Type:     "task",
+				Metadata: map[string]string{
+					beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+					beadmeta.FormulaContractMetadataKey: "graph.v2",
+					beadmeta.RoutedToMetadataKey:        identity,
+				},
+			}, true, nil
 		},
 	}
 	opts := hookClaimOptions{
@@ -2224,13 +2228,13 @@ func TestHookClaimSkipsWorkflowTopologyAheadOfRoutedWork(t *testing.T) {
 		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if !claimed {
-		t.Fatal("executable work candidate was not claimed")
+		t.Fatal("workflow root was not claimed")
 	}
 	var result hookClaimJSONResult
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
 	}
-	if result.Action != "work" || result.BeadID != workID {
+	if result.Action != "work" || result.BeadID != rootID {
 		t.Fatalf("unexpected claim result: %+v", result)
 	}
 }

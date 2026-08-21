@@ -493,7 +493,6 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 	for _, candidate := range candidates {
 		if strings.TrimSpace(candidate.ID) == "" ||
 			hookClaimCandidateIsMessage(candidate) ||
-			hookClaimCandidateIsWorkflowTopology(candidate) ||
 			!strings.EqualFold(strings.TrimSpace(candidate.Status), "open") ||
 			!hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) {
 			continue
@@ -695,7 +694,6 @@ func mergeHookClaimCandidateMetadata(candidate, claimed beads.Bead) beads.Bead {
 // session's route targets.
 func hookCandidateClaimable(candidate beads.Bead, routeTargets []string) bool {
 	return strings.TrimSpace(candidate.ID) != "" &&
-		!hookClaimCandidateIsWorkflowTopology(candidate) &&
 		strings.TrimSpace(candidate.Assignee) == "" &&
 		hookClaimMatchesRoute(candidate, routeTargets)
 }
@@ -713,7 +711,7 @@ func reportHookClaimRejected(candidate, claimed beads.Bead, opts hookClaimOption
 
 func hookClaimExistingAssignment(candidates []beads.Bead, opts hookClaimOptions) (hookClaimJSONResult, beads.Bead, bool) {
 	for _, candidate := range candidates {
-		if hookClaimCandidateIsMessage(candidate) || hookClaimCandidateIsWorkflowTopology(candidate) {
+		if hookClaimCandidateIsMessage(candidate) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(candidate.Status), "in_progress") &&
@@ -744,25 +742,6 @@ func hookClaimExistingAssignment(candidates []beads.Bead, opts hookClaimOptions)
 // claimFirstEligibleHookCandidate ever sees the routed candidates.
 func hookClaimCandidateIsMessage(candidate beads.Bead) bool {
 	return strings.EqualFold(strings.TrimSpace(candidate.Type), "message")
-}
-
-// hookClaimCandidateIsWorkflowTopology reports whether a candidate is a
-// non-executable graph-v2 topology latch or sidecar. These beads can be
-// Ready-visible and may carry the workflow's route for observability, but a
-// normal worker must never claim or execute them. Pre-graph-v2 workflow roots
-// are the compatibility exception: legacy formulas routed executable root work
-// through gc.run_target, so an unstamped workflow kind remains claimable.
-func hookClaimCandidateIsWorkflowTopology(candidate beads.Bead) bool {
-	kind := strings.TrimSpace(candidate.Metadata[beadmeta.KindMetadataKey])
-	if kind == beadmeta.KindWorkflow {
-		return strings.TrimSpace(candidate.Metadata[beadmeta.FormulaContractMetadataKey]) == "graph.v2"
-	}
-	for _, topologyKind := range beadmeta.WorkflowTopologyKinds {
-		if kind == topologyKind {
-			return true
-		}
-	}
-	return false
 }
 
 // writeHookClaimWorkResultForBead stamps, correlates and reports one claimed or
