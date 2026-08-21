@@ -2184,6 +2184,57 @@ func TestHookClaimSkipsMessageBeadsAheadOfRoutedWork(t *testing.T) {
 	}
 }
 
+// Workflow roots, scope latches, and formula spec sidecars are graph topology,
+// not executable work. They may still appear in a broad work_query and may
+// retain an assignee or route. None of the existing-assignment,
+// ready-assignment, or fresh-claim tiers may return them to a worker.
+func TestHookClaimSkipsWorkflowTopologyAheadOfRoutedWork(t *testing.T) {
+	const (
+		identity = "builder"
+		workID   = "ga-real-work"
+	)
+	runner := func(string, string) (string, error) {
+		return `[
+			{"id":"ga-root","status":"in_progress","assignee":"` + identity + `","metadata":{"gc.kind":"workflow","gc.formula_contract":"graph.v2","gc.routed_to":"` + identity + `"}},
+			{"id":"ga-scope","status":"open","assignee":"` + identity + `","metadata":{"gc.kind":"scope","gc.routed_to":"` + identity + `"}},
+			{"id":"ga-spec","status":"open","assignee":"","metadata":{"gc.kind":"spec","gc.routed_to":"` + identity + `"}},
+			{"id":"` + workID + `","status":"open","issue_type":"task","assignee":"","metadata":{"gc.routed_to":"` + identity + `"}}
+		]`, nil
+	}
+	claimed := false
+	ops := hookClaimOps{
+		Runner: runner,
+		Claim: func(_ context.Context, _ string, _ []string, id, assignee string) (beads.Bead, bool, error) {
+			if id != workID {
+				t.Fatalf("store.Claim called for topology bead %q; want executable work %q", id, workID)
+			}
+			claimed = true
+			return beads.Bead{ID: id, Status: "in_progress", Assignee: assignee, Type: "task"}, true, nil
+		},
+	}
+	opts := hookClaimOptions{
+		Assignee:           identity,
+		IdentityCandidates: hookClaimIdentityCandidates(identity),
+		RouteTargets:       hookClaimRouteTargets(identity),
+		JSON:               true,
+	}
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !claimed {
+		t.Fatal("executable work candidate was not claimed")
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Action != "work" || result.BeadID != workID {
+		t.Fatalf("unexpected claim result: %+v", result)
+	}
+}
+
 func TestHookInjectAlwaysExitsZero(t *testing.T) {
 	// Even on command failure, inject mode exits 0.
 	runner := func(string, string) (string, error) { return "", fmt.Errorf("command failed") }
