@@ -85,7 +85,11 @@ export function stateTone(state: string): StatusTone {
       return 'ok';
     case 'rate-limited':
     case 'rate_limited':
+      return 'warn';
     case 'waiting':
+      // Backend waiting means a running agent still owns an active bead but
+      // has no recent activity. It is worth surfacing, but it is not evidence
+      // of a provider throttle.
       return 'warn';
     case 'failed':
     case 'closed':

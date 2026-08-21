@@ -116,6 +116,16 @@ describe('stateTone', () => {
 });
 
 describe('buildAgentSynopsis', () => {
+  it('reports waiting separately from provider rate limits', () => {
+    const synopsis = buildAgentSynopsis([
+      mkAgent('waiting'),
+      mkAgent('rate-limited'),
+      mkAgent('rate_limited'),
+    ]);
+    expect(synopsis).toContain('1 waiting');
+    expect(synopsis).toContain('2 rate-limited');
+  });
+
   it('reports detached agents as a distinct count, not bucketed under idle', () => {
     const rows: AgentResponse[] = [
       mkAgent('active'),
