@@ -82,6 +82,7 @@ export function stateTone(state: string): StatusTone {
   switch (state) {
     case 'active':
     case 'running':
+    case 'working':
       return 'ok';
     case 'rate-limited':
     case 'rate_limited':

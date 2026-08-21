@@ -99,6 +99,10 @@ describe('agentRowLabel', () => {
 });
 
 describe('stateTone', () => {
+  it('marks a backend working agent as healthy', () => {
+    expect(stateTone('working')).toBe('ok');
+  });
+
   it('classifies detached agents explicitly (not via default fallthrough)', () => {
     // Detached is paused-alive — same neutral palette as idle/asleep, but the
     // case is explicit so a reviewer sees the intent rather than a silent
@@ -116,6 +120,13 @@ describe('stateTone', () => {
 });
 
 describe('buildAgentSynopsis', () => {
+  it('reports backend working and stopped states without folding them into idle', () => {
+    const synopsis = buildAgentSynopsis([mkAgent('working'), mkAgent('stopped'), mkAgent('idle')]);
+    expect(synopsis).toContain('1 active');
+    expect(synopsis).toContain('1 idle');
+    expect(synopsis).toContain('1 stopped');
+  });
+
   it('reports waiting separately from provider rate limits', () => {
     const synopsis = buildAgentSynopsis([
       mkAgent('waiting'),

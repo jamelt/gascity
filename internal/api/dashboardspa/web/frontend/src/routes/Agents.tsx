@@ -673,6 +673,7 @@ export type SynopsisBucket =
   | 'waiting'
   | 'detached'
   | 'rate-limited'
+  | 'stopped'
   | 'stuck'
   | 'suspended';
 
@@ -681,6 +682,7 @@ function stateBucket(agent: SupervisorAgent): SynopsisBucket {
   switch (agent.state) {
     case 'active':
     case 'running':
+    case 'working':
       return 'active';
     case 'detached':
       return 'detached';
@@ -689,6 +691,8 @@ function stateBucket(agent: SupervisorAgent): SynopsisBucket {
       return 'rate-limited';
     case 'waiting':
       return 'waiting';
+    case 'stopped':
+      return 'stopped';
     case 'failed':
     case 'closed':
     case 'errored':
@@ -712,6 +716,7 @@ export function buildAgentSynopsis(rows: ReadonlyArray<SupervisorAgent>): string
   const waiting = counts.get('waiting') ?? 0;
   const detached = counts.get('detached') ?? 0;
   const rateLimited = counts.get('rate-limited') ?? 0;
+  const stopped = counts.get('stopped') ?? 0;
   const stuck = counts.get('stuck') ?? 0;
   const suspended = counts.get('suspended') ?? 0;
   if (active > 0) parts.push(`${active} active`);
@@ -719,6 +724,7 @@ export function buildAgentSynopsis(rows: ReadonlyArray<SupervisorAgent>): string
   if (waiting > 0) parts.push(`${waiting} waiting`);
   if (detached > 0) parts.push(`${detached} detached`);
   if (rateLimited > 0) parts.push(`${rateLimited} rate-limited`);
+  if (stopped > 0) parts.push(`${stopped} stopped`);
   if (stuck > 0) parts.push(`${stuck} stuck`);
   if (suspended > 0) parts.push(`${suspended} suspended`);
   return parts.join(', ') + '.';
