@@ -126,20 +126,22 @@ func constSleepDuration(arg ast.Expr) (time.Duration, bool) {
 
 // TestAdapterWaitBudgetStaysAHangDetector guards adapterWaitBudget against
 // being shrunk back into flake territory. ga-b9lkux converts eight fixed
-// sleeps (longest 3s, in TestInterruptMidTurnContinuesTheLoop) into polls
-// bounded by this constant; shrinking it below a justified floor would
-// silently reintroduce the same class of failure on a machine slow enough to
-// need the full budget.
+// sleeps into polls bounded by this constant and unifies the file's
+// pre-existing waitForOutput calls (longest 20s, e.g.
+// TestInterruptKillsASigintIgnoringTurn) onto the same budget; shrinking it
+// below a justified floor would silently reintroduce the same class of
+// failure on a machine slow enough to need the full budget.
 //
-// The floor is twice the largest fixed deadline removed, matching the
-// convention already established for hangBudget in
+// The floor is twice the largest deadline this budget now covers — the
+// pre-existing 20s waitForOutput bound, not the largest raw sleep removed
+// (3s) — matching the convention already established for hangBudget in
 // cmd/gc/hangbudget_helpers_test.go (TestHangBudgetStaysAHangDetector).
 func TestAdapterWaitBudgetStaysAHangDetector(t *testing.T) {
 	t.Parallel()
 
-	const largestReplacedDeadline = 3 * time.Second
+	const largestReplacedDeadline = 20 * time.Second
 	if adapterWaitBudget < 2*largestReplacedDeadline {
-		t.Fatalf("adapterWaitBudget = %s, want >= %s (twice the largest fixed sleep it replaced); "+
+		t.Fatalf("adapterWaitBudget = %s, want >= %s (twice the largest wait deadline it covers); "+
 			"it is a hang detector, not a latency assertion — do not tune it to make a test pass",
 			adapterWaitBudget, 2*largestReplacedDeadline)
 	}

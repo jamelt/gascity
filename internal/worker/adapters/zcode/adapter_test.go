@@ -297,7 +297,7 @@ func (s *session) signal(sig syscall.Signal) {
 // adapterWaitBudget bounds every lifecycle wait in this suite. Generous on
 // purpose: it is a deadlock guard, not a timing assertion, and a loaded machine
 // must not turn a slow turn into a failure.
-const adapterWaitBudget = 20 * time.Second
+const adapterWaitBudget = 40 * time.Second
 
 // waitForTurns blocks until the adapter has completed n turns, counted by its
 // ready markers (startup prints one, then one per finished turn). This is the
@@ -328,13 +328,14 @@ func (s *session) waitForFailures(n int) {
 	}
 }
 
-// waitForOutput blocks until needle appears in the adapter's stdout.
-func (s *session) waitForOutput(needle string, timeout time.Duration) {
+// waitForOutput blocks until needle appears in the adapter's stdout, bounded
+// by adapterWaitBudget.
+func (s *session) waitForOutput(needle string) {
 	s.t.Helper()
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(adapterWaitBudget)
 	for !strings.Contains(s.output(), needle) {
 		if time.Now().After(deadline) {
-			s.t.Fatalf("%q never appeared within %s:\n%s", needle, timeout, s.output())
+			s.t.Fatalf("%q never appeared within %s:\n%s", needle, adapterWaitBudget, s.output())
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -468,9 +469,13 @@ func TestIdleSeparatedPromptsStaySeparate(t *testing.T) {
 	h := newHarness(t, nil)
 	s := h.start()
 	s.send("first prompt")
-	time.Sleep(2500 * time.Millisecond)
+	// Wait for the first turn to fully resolve so "second prompt" starts a
+	// fresh read instead of landing inside the first turn's drain window.
+	s.waitForTurns(1)
 	s.send("second prompt")
-	time.Sleep(2500 * time.Millisecond)
+	// No settle wait needed here: the process can't reach EOF-and-exit until
+	// it has finished processing "second prompt", so closeAndWait's own
+	// cmd.Wait() already blocks for exactly that.
 	if _, code := s.closeAndWait(); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
@@ -572,11 +577,14 @@ func TestDrainKeepsPartialTrailingLine(t *testing.T) {
 	h := newHarness(t, nil)
 	s := h.start()
 	s.sendRaw("first line\n")
-	// No trailing newline, and a gap longer than the drain window.
+	// No trailing newline; waitForTurns spans the drain window (it only
+	// resolves once the combined line completes as one turn).
 	s.sendRaw("trailing line without a newline")
-	time.Sleep(2500 * time.Millisecond)
+	s.waitForTurns(1)
+	// A bare newline probes an empty line, which the adapter skips without
+	// starting a turn — nothing to wait for. closeAndWait's cmd.Wait() still
+	// blocks correctly for however long that probe's drain cycle takes.
 	s.sendRaw("\n")
-	time.Sleep(2500 * time.Millisecond)
 	if _, code := s.closeAndWait(); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
@@ -736,9 +744,14 @@ func TestInterruptMidTurnContinuesTheLoop(t *testing.T) {
 	h := newHarness(t, map[string]string{"STUB_SLEEP": "5", "STUB_SID": "sess_int"})
 	s := h.start()
 	s.send("slow turn")
-	time.Sleep(3 * time.Second) // inside the stub's sleep
+	// Interrupt only once the pane says busy, so SIGINT hits a turn that has
+	// genuinely started rather than racing the child's own launch.
+	s.waitForOutput("zcode-repl turn in flight")
 	s.signal(syscall.SIGINT)
-	time.Sleep(2 * time.Second)
+	// An interrupted turn still reprints the ready marker (error rc= line,
+	// then MARKER), so waitForTurns(1) confirms the interrupt was fully
+	// absorbed before checking liveness below.
+	s.waitForTurns(1)
 
 	if !s.alive() {
 		t.Fatalf("adapter exited on SIGINT; it must absorb it:\n%s", s.output())
@@ -773,18 +786,12 @@ func TestInterruptKillsASigintIgnoringTurn(t *testing.T) {
 	// Interrupt the instant the pane says busy. That is what an observer
 	// watching for the in-flight line does, so the announcement must not
 	// precede the child it describes.
-	s.waitForOutput("zcode-repl turn in flight", 20*time.Second)
+	s.waitForOutput("zcode-repl turn in flight")
 	s.signal(syscall.SIGINT)
 
 	// The adapter must report the turn as failed rather than block until the
 	// stub's own deadline.
-	deadline := time.Now().Add(15 * time.Second)
-	for !strings.Contains(s.output(), "zcode-repl error rc=") {
-		if time.Now().After(deadline) {
-			t.Fatalf("adapter did not report an interrupted turn within 15s:\n%s", s.output())
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
+	s.waitForOutput("zcode-repl error rc=")
 	if !s.alive() {
 		t.Fatalf("adapter exited on SIGINT; it must absorb it:\n%s", s.output())
 	}
@@ -810,10 +817,11 @@ func TestInterruptWhileIdleDoesNotExit(t *testing.T) {
 
 	h := newHarness(t, nil)
 	s := h.start()
-	time.Sleep(2 * time.Second) // idle, blocked in read
+	s.waitForTurns(0) // idle, blocked in read
 	s.signal(syscall.SIGINT)
-	time.Sleep(2 * time.Second)
-
+	// An idle SIGINT produces no output at all (stop_turn no-ops with no
+	// turn_pid set), so there is nothing to poll for here; the send and
+	// waitForTurns(1) below are what actually prove the adapter survived.
 	if !s.alive() {
 		t.Fatalf("adapter exited on an idle SIGINT:\n%s", s.output())
 	}
@@ -833,7 +841,7 @@ func TestTerminateExitsCleanly(t *testing.T) {
 
 	h := newHarness(t, nil)
 	s := h.start()
-	s.waitForOutput("zcode-repl ready", 20*time.Second)
+	s.waitForOutput("zcode-repl ready")
 	s.signal(syscall.SIGTERM)
 	if _, code := s.wait(); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
@@ -1003,9 +1011,9 @@ func TestExportMirrorPublishesTheUserTurnBeforeTheReply(t *testing.T) {
 	h.env["STUB_SLEEP"] = "30"
 	s := h.start()
 	s.send("the long turn")
-	s.waitForOutput("zcode-repl turn in flight", 20*time.Second)
+	s.waitForOutput("zcode-repl turn in flight")
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(adapterWaitBudget)
 	for {
 		export := h.readExport("sess_pending")
 		if len(export.Messages) == 3 {
@@ -1024,7 +1032,7 @@ func TestExportMirrorPublishesTheUserTurnBeforeTheReply(t *testing.T) {
 	// Interrupting now leaves the user turn unpaired — exactly what an
 	// interrupted turn looks like for every other family.
 	s.signal(syscall.SIGINT)
-	s.waitForOutput("zcode-repl error rc=", 15*time.Second)
+	s.waitForOutput("zcode-repl error rc=")
 	s.signal(syscall.SIGTERM)
 	if _, code := s.wait(); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
@@ -1127,9 +1135,9 @@ func TestCancelledFirstTurnStaysVisibleAndIsAdopted(t *testing.T) {
 	h := newHarness(t, map[string]string{"STUB_SLEEP": "30", "STUB_SID": "sess_after_cancel"})
 	s := h.start()
 	s.send("the boot prompt")
-	s.waitForOutput("zcode-repl turn in flight", 20*time.Second)
+	s.waitForOutput("zcode-repl turn in flight")
 	s.signal(syscall.SIGINT)
-	s.waitForOutput("zcode-repl error rc=", 15*time.Second)
+	s.waitForOutput("zcode-repl error rc=")
 
 	pending := h.readExport(h.pendingSessionID())
 	if len(pending.Messages) != 2 || pending.Messages[0].Parts[0].Text != "the boot prompt" {
@@ -1143,7 +1151,7 @@ func TestCancelledFirstTurnStaysVisibleAndIsAdopted(t *testing.T) {
 	h.env["STUB_SLEEP"] = "0"
 	h.control(map[string]string{"STUB_SLEEP": "0"})
 	s.send("the turn that lands")
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(adapterWaitBudget)
 	for {
 		if _, err := os.Stat(filepath.Join(h.mirrorDir, h.epochScope(), "sess_after_cancel.json")); err == nil {
 			break
@@ -1215,9 +1223,9 @@ func TestInterruptedTurnClosesTheMirrorEntry(t *testing.T) {
 	h.env["STUB_SLEEP"] = "30"
 	s := h.start()
 	s.send("a turn to interrupt")
-	s.waitForOutput("zcode-repl turn in flight", 20*time.Second)
+	s.waitForOutput("zcode-repl turn in flight")
 	s.signal(syscall.SIGINT)
-	s.waitForOutput("zcode-repl error rc=", 15*time.Second)
+	s.waitForOutput("zcode-repl error rc=")
 	s.signal(syscall.SIGTERM)
 	if _, code := s.wait(); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
