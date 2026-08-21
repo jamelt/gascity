@@ -115,6 +115,81 @@ func TestAgentListPoolExpansion(t *testing.T) {
 	}
 }
 
+func TestAgentListBoundedPoolUsesPersistedRuntimeSessionName(t *testing.T) {
+	state := newFakeState(t)
+	state.cfg.Agents = []config.Agent{{
+		Name: "polecat", Dir: "myrig",
+		MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2),
+	}}
+	state.cityBeadStore = beads.NewMemStore()
+	const (
+		agentName   = "myrig/polecat-1"
+		runtimeName = "myrig--polecat-1-pool"
+	)
+	if _, err := state.cityBeadStore.Create(beads.Bead{
+		Type:   "session",
+		Labels: []string{"gc:session"},
+		Metadata: map[string]string{
+			"state":        "active",
+			"template":     "myrig/polecat",
+			"agent_name":   agentName,
+			"session_name": runtimeName,
+		},
+	}); err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	if err := state.sp.Start(context.Background(), runtimeName, runtime.Config{}); err != nil {
+		t.Fatalf("start runtime: %v", err)
+	}
+
+	srv := New(state)
+	h := newTestCityHandlerWith(t, state, srv)
+	req := httptest.NewRequest("GET", cityURL(state, "/agents"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var resp struct {
+		Items []agentResponse `json:"items"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Items) != 2 {
+		t.Fatalf("items = %d, want 2", len(resp.Items))
+	}
+	if got := resp.Items[0]; !got.Running || got.Session == nil || got.Session.Name != runtimeName {
+		t.Fatalf("first pool member = %+v, want running session %q", got, runtimeName)
+	}
+	if resp.Items[1].Running {
+		t.Fatalf("second pool member = %+v, want stopped", resp.Items[1])
+	}
+	gotDetail, err := srv.agentByName(context.Background(), agentName)
+	if err != nil {
+		t.Fatalf("agent detail: %v", err)
+	}
+	if !gotDetail.Body.Running || gotDetail.Body.Session == nil || gotDetail.Body.Session.Name != runtimeName {
+		t.Fatalf("agent detail = %+v, want running session %q", gotDetail.Body, runtimeName)
+	}
+
+	detail := srv.buildStatusBody(context.Background(), true)
+	var found bool
+	for _, agent := range detail.AgentDetails {
+		if agent.QualifiedName != agentName {
+			continue
+		}
+		found = true
+		if !agent.Running || agent.SessionName != runtimeName {
+			t.Fatalf("status agent = %+v, want running session %q", agent, runtimeName)
+		}
+	}
+	if !found {
+		t.Fatalf("status details missing %q: %+v", agentName, detail.AgentDetails)
+	}
+}
+
 func TestAgentListUnlimitedPoolDiscovery(t *testing.T) {
 	state := newFakeState(t)
 	state.cfg.Agents = []config.Agent{

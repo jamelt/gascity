@@ -189,7 +189,7 @@ func (s *Server) buildStatusBody(ctx context.Context, lite bool) StatusBody {
 			if rigName != "" {
 				perRigAgentTotals[rigName]++
 			}
-			sessName := agentSessionName(cityName, ea.qualifiedName, sessTmpl)
+			sessName := agentSessionNameFromSnapshot(sessionSnapshot, cityName, ea.qualifiedName, sessTmpl)
 			info, hasInfo := sessionSnapshot.bySessionName[sessName]
 			running := statusProviderRunning(sp, sessName)
 			// An agent whose work runs under a relocated-graph wisp session is
@@ -484,6 +484,7 @@ func (s *Server) countSessions(snapshot statusSessionSnapshot) (active, suspende
 
 type statusSessionSnapshot struct {
 	bySessionName map[string]statusSessionInfo
+	byAgentName   map[string]statusSessionInfo
 	byTemplate    map[string][]statusSessionInfo
 	partialErrors []string
 }
@@ -510,6 +511,7 @@ type statusSessionInfo struct {
 func (s *Server) statusSessionSnapshot(ctx context.Context) statusSessionSnapshot {
 	snapshot := statusSessionSnapshot{
 		bySessionName: make(map[string]statusSessionInfo),
+		byAgentName:   make(map[string]statusSessionInfo),
 		byTemplate:    make(map[string][]statusSessionInfo),
 	}
 	sessions := s.state.SessionsBeadStore()
@@ -604,11 +606,50 @@ func (s *Server) statusSessionSnapshot(ctx context.Context) statusSessionSnapsho
 		}
 		seenSessionName[info.sessionName] = true
 		snapshot.bySessionName[info.sessionName] = info
+		if info.agentName != "" {
+			if current, ok := snapshot.byAgentName[info.agentName]; !ok || statusSessionInfoRank(info) > statusSessionInfoRank(current) {
+				snapshot.byAgentName[info.agentName] = info
+			}
+		}
 		if info.template != "" {
 			snapshot.byTemplate[info.template] = append(snapshot.byTemplate[info.template], info)
 		}
 	}
 	return snapshot
+}
+
+// statusSessionInfoRank prefers the live lifecycle row when repair or churn
+// temporarily leaves more than one open session bead for the same agent
+// identity. The runtime name on that row is the authoritative bridge between
+// the configured identity and its provider session.
+func statusSessionInfoRank(info statusSessionInfo) int {
+	switch info.state {
+	case session.StateActive:
+		return 5
+	case session.StateCreating, session.StateStartPending:
+		return 4
+	case session.StateDraining:
+		return 3
+	case session.StateSuspended, session.StateQuarantined:
+		return 2
+	case session.StateAsleep, session.StateDrained:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// agentSessionNameFromSnapshot resolves a configured agent identity through
+// its open session bead before falling back to the legacy deterministic name.
+// Pool slots can deliberately run under a different name (for example the
+// transient "-pool" step-aside), and aliases or bounded long names may differ
+// too. Treating the configured identity as the provider name makes live pool
+// workers appear stopped in the dashboard and status census.
+func agentSessionNameFromSnapshot(snapshot statusSessionSnapshot, cityName, qualifiedName, sessionTemplate string) string {
+	if info, ok := snapshot.byAgentName[qualifiedName]; ok && strings.TrimSpace(info.sessionName) != "" {
+		return info.sessionName
+	}
+	return agentSessionName(cityName, qualifiedName, sessionTemplate)
 }
 
 // statusWorkResult is one store's contribution to the work counts.
@@ -977,7 +1018,7 @@ func appendUnlimitedPoolSessionBeads(expanded []expandedAgent, a config.Agent, c
 
 	seenSessionNames := make(map[string]bool, len(expanded))
 	for _, ea := range expanded {
-		seenSessionNames[agentSessionName(cityName, ea.qualifiedName, sessTmpl)] = true
+		seenSessionNames[agentSessionNameFromSnapshot(snapshot, cityName, ea.qualifiedName, sessTmpl)] = true
 	}
 
 	poolName := a.QualifiedName()
