@@ -2591,6 +2591,75 @@ func TestTerminalAbortScopeFailureSupersededHardAttemptIsNotTerminal(t *testing.
 	}
 }
 
+func TestTerminalTopLevelWorkflowFailureIgnoresCompileTimeAttemptHistory(t *testing.T) {
+	t.Parallel()
+
+	attempt := beads.Bead{
+		Status: "closed",
+		Metadata: map[string]string{
+			beadmeta.OutcomeMetadataKey:    beadmeta.OutcomeFail,
+			beadmeta.AttemptMetadataKey:    "1",
+			beadmeta.ControlForMetadataKey: "plan",
+		},
+	}
+	if terminalTopLevelWorkflowFailure(attempt) {
+		t.Fatal("compile-time attempt history must not outvote its logical control")
+	}
+}
+
+func TestProcessWorkflowFinalizeIgnoresFailedCompileTimeAttemptAfterLogicalPass(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		},
+	})
+	_ = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "plan attempt 1 (superseded)",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			beadmeta.RootBeadIDMetadataKey:   workflow.ID,
+			beadmeta.OutcomeMetadataKey:      beadmeta.OutcomeFail,
+			beadmeta.FailureClassMetadataKey: beadmeta.FailureClassTransient,
+			beadmeta.AttemptMetadataKey:      "1",
+			beadmeta.ControlForMetadataKey:   "plan",
+		},
+	})
+	_ = mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "plan logical",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindRalph,
+			beadmeta.RootBeadIDMetadataKey: workflow.ID,
+			beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+		},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindWorkflowFinalize,
+			beadmeta.RootBeadIDMetadataKey: workflow.ID,
+		},
+	})
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+	}
+}
+
 // TestProcessWorkflowFinalizeIgnoresSupersededHardRetryDescendant is the FIX 2
 // integration guard for #4008: a review loop whose iteration.3 attempt closed
 // control_dispatch_error/hard but whose later iterations passed must finalize
@@ -4858,6 +4927,174 @@ func TestProcessRalphCheckExhaustsRetries(t *testing.T) {
 	}
 	if got := logicalAfter.Metadata["gc.failed_attempt"]; got != "2" {
 		t.Fatalf("logical failed attempt = %q, want 2", got)
+	}
+}
+
+// A top-level Ralph failure must fail closed across ordinary blocks edges.
+// Beads considers every closed blocker satisfied, regardless of gc.outcome, so
+// the controller must skip the downstream logical step and its already-minted
+// attempt before a worker can claim either one. This exercises the production
+// compile -> instantiate -> controller path used by two checked Fab steps.
+func TestProcessRalphControlExhaustionSkipsDownstreamAndFinalizesWorkflowFail(t *testing.T) {
+	t.Parallel()
+	formulatest.EnableV2ForTest(t)
+	previousGraphApply := molecule.IsGraphApplyEnabled()
+	molecule.SetGraphApplyEnabled(true)
+	t.Cleanup(func() { molecule.SetGraphApplyEnabled(previousGraphApply) })
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`
+[workspace]
+name = "test-city"
+provider = "claude"
+
+[providers.claude]
+base = "builtin:claude"
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	formulaDir := filepath.Join(cityPath, "formulas")
+	if err := os.MkdirAll(formulaDir, 0o755); err != nil {
+		t.Fatalf("mkdir formulas: %v", err)
+	}
+	const source = `
+formula = "terminal-fail-propagation"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[[steps]]
+id = "plan"
+title = "Plan"
+
+[steps.check]
+max_attempts = 2
+
+[steps.check.check]
+mode = "exec"
+path = ".gc/scripts/always-fail.sh"
+timeout = "30s"
+
+[[steps]]
+id = "implement"
+title = "Implement"
+needs = ["plan"]
+
+[steps.check]
+max_attempts = 2
+
+[steps.check.check]
+mode = "exec"
+path = ".gc/scripts/always-pass.sh"
+timeout = "30s"
+
+[[steps]]
+id = "independent"
+title = "Independent work"
+`
+	if err := os.WriteFile(filepath.Join(formulaDir, "terminal-fail-propagation.formula.toml"), []byte(source), 0o644); err != nil {
+		t.Fatalf("write formula: %v", err)
+	}
+	writeCheckScript(t, cityPath, "always-fail.sh", "#!/bin/sh\nexit 1\n")
+	writeCheckScript(t, cityPath, "always-pass.sh", "#!/bin/sh\nexit 0\n")
+
+	store := beads.NewMemStore()
+	cooked, err := molecule.Cook(context.Background(), store, "terminal-fail-propagation", []string{formulaDir}, molecule.Options{})
+	if err != nil {
+		t.Fatalf("Cook: %v", err)
+	}
+	planID := cooked.IDMapping["terminal-fail-propagation.plan"]
+	implementID := cooked.IDMapping["terminal-fail-propagation.implement"]
+	implementAttemptID := cooked.IDMapping["terminal-fail-propagation.implement.iteration.1"]
+	independentID := cooked.IDMapping["terminal-fail-propagation.independent"]
+	finalizerID := cooked.IDMapping["terminal-fail-propagation.workflow-finalize"]
+	for key, id := range map[string]string{
+		"plan": planID, "implement": implementID, "implement attempt": implementAttemptID,
+		"independent": independentID, "finalizer": finalizerID,
+	} {
+		if id == "" {
+			t.Fatalf("missing %s ID in mapping: %+v", key, cooked.IDMapping)
+		}
+	}
+	process := func(label, id string) ControlResult {
+		t.Helper()
+		for range 10 {
+			result, err := ProcessControl(store, mustGetBead(t, store, id), ProcessOptions{CityPath: cityPath, StorePath: cityPath})
+			if errors.Is(err, ErrControlPending) {
+				continue
+			}
+			if err != nil {
+				t.Fatalf("ProcessControl(%s): %v\n%s", label, err, memberReport(t, store, cooked.RootID))
+			}
+			return result
+		}
+		t.Fatalf("ProcessControl(%s) remained pending\n%s", label, memberReport(t, store, cooked.RootID))
+		return ControlResult{}
+	}
+
+	plan := mustGetBead(t, store, planID)
+	firstAttempt, err := findLatestAttempt(store, plan)
+	if err != nil {
+		t.Fatalf("find plan attempt 1: %v", err)
+	}
+	if err := updateMetadataAndClose(store, firstAttempt.ID, map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass}); err != nil {
+		t.Fatalf("close plan attempt 1: %v", err)
+	}
+	result := process("plan attempt 1", planID)
+	if !result.Processed || result.Action != "retry" {
+		t.Fatalf("plan attempt 1 result = %+v, want processed retry", result)
+	}
+
+	plan = mustGetBead(t, store, planID)
+	secondAttempt, err := findLatestAttempt(store, plan)
+	if err != nil {
+		t.Fatalf("find plan attempt 2: %v", err)
+	}
+	if secondAttempt.ID == firstAttempt.ID {
+		t.Fatalf("attempt 2 reused attempt 1 ID %s", firstAttempt.ID)
+	}
+	if err := updateMetadataAndClose(store, secondAttempt.ID, map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass}); err != nil {
+		t.Fatalf("close plan attempt 2: %v", err)
+	}
+	result = process("plan attempt 2", planID)
+	if !result.Processed || result.Action != "fail" {
+		t.Fatalf("plan attempt 2 result = %+v, want processed fail", result)
+	}
+
+	for name, id := range map[string]string{"implement logical": implementID, "implement attempt": implementAttemptID} {
+		after := mustGetBead(t, store, id)
+		if after.Status != "closed" || after.Metadata[beadmeta.OutcomeMetadataKey] != beadmeta.OutcomeSkipped {
+			t.Fatalf("%s = status %q outcome %q, want closed/skipped before any worker claim",
+				name, after.Status, after.Metadata[beadmeta.OutcomeMetadataKey])
+		}
+	}
+	if finalizer := mustGetBead(t, store, finalizerID); finalizer.Status != "open" {
+		t.Fatalf("workflow finalizer status = %q, want open for root settlement", finalizer.Status)
+	}
+	independent := mustGetBead(t, store, independentID)
+	if independent.Status != "open" {
+		t.Fatalf("independent sibling status = %q, want open", independent.Status)
+	}
+	if err := updateMetadataAndClose(store, independentID, map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass}); err != nil {
+		t.Fatalf("close independent sibling: %v", err)
+	}
+	ready, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready after plan failure: %v", err)
+	}
+	for _, candidate := range ready {
+		if candidate.ID == implementID || candidate.ID == implementAttemptID {
+			t.Fatalf("failed-plan dependent %s became ready for claim", candidate.ID)
+		}
+	}
+
+	result = process("workflow-finalize", finalizerID)
+	if !result.Processed || result.Action != "workflow-fail" {
+		t.Fatalf("finalizer result = %+v, want processed workflow-fail", result)
+	}
+	root := mustGetBead(t, store, cooked.RootID)
+	if root.Status != "closed" || root.Metadata[beadmeta.OutcomeMetadataKey] != beadmeta.OutcomeFail {
+		t.Fatalf("workflow root = status %q outcome %q, want closed/fail", root.Status, root.Metadata[beadmeta.OutcomeMetadataKey])
 	}
 }
 

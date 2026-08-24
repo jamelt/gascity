@@ -140,6 +140,179 @@ func TestRunRalphCheckRejectsAssetPathWhenLayerNotTrusted(t *testing.T) {
 	}
 }
 
+// An in-flight graph keeps the exact formula source that compiled it. A pack
+// pin reload may move FormulaSearchPaths to a new immutable cache entry while
+// that graph still carries an absolute check path under the old entry. The
+// persisted source's sibling assets directory remains the narrow trust root
+// for that graph; the cache as a whole must not become trusted.
+func TestRunRalphCheckAcceptsPersistedFormulaSourceAfterSearchPathMoves(t *testing.T) {
+	tmp := t.TempDir()
+	gcHome := filepath.Join(tmp, "gc-home")
+	t.Setenv("GC_HOME", gcHome)
+	oldPack := filepath.Join(gcHome, "cache", "repos", "old-pin", "packs", "fab-pack")
+	newPack := filepath.Join(gcHome, "cache", "repos", "new-pin", "packs", "fab-pack")
+	oldFormula := filepath.Join(oldPack, "formulas", "fab-build.formula.toml")
+	oldCheck := filepath.Join(oldPack, "assets", "scripts", "checks", "implement-done.sh")
+	for _, dir := range []string{filepath.Dir(oldFormula), filepath.Dir(oldCheck), filepath.Join(newPack, "formulas")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(oldFormula, []byte("formula = \"fab-build\"\n"), 0o644); err != nil {
+		t.Fatalf("write old formula source: %v", err)
+	}
+	if err := os.WriteFile(oldCheck, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write old check: %v", err)
+	}
+
+	cityPath := filepath.Join(tmp, "city")
+	storePath := filepath.Join(tmp, "rig")
+	for _, dir := range []string{cityPath, storePath} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	store := beads.NewMemStore()
+	root := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "in-flight fab-build",
+		Type:  "task",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+			beadmeta.FormulaSourceMetadataKey:   oldFormula,
+		},
+	})
+	check := beads.Bead{
+		ID:   "check-old-pin",
+		Type: "task",
+		Metadata: map[string]string{
+			beadmeta.CheckPathMetadataKey:       oldCheck,
+			beadmeta.CheckTimeoutMetadataKey:    "30s",
+			beadmeta.RootBeadIDMetadataKey:      root.ID,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		},
+	}
+	subject := beads.Bead{ID: "run-old-pin", Type: "task", Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: root.ID}}
+
+	result, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath:           cityPath,
+		StorePath:          storePath,
+		FormulaSearchPaths: []string{filepath.Join(newPack, "formulas")},
+	})
+	if err != nil {
+		t.Fatalf("runRalphCheck rejected persisted old-pin asset: %v", err)
+	}
+	if result.Outcome != convergence.GatePass {
+		t.Fatalf("Outcome = %q (stderr=%q), want pass", result.Outcome, result.Stderr)
+	}
+	// The persisted source is the provenance anchor, not a permanent cache
+	// trust grant. Once that source is removed, the old absolute asset must
+	// fail closed even if the script itself still exists.
+	if err := os.Remove(oldFormula); err != nil {
+		t.Fatalf("remove old formula source: %v", err)
+	}
+	if _, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath:           cityPath,
+		StorePath:          storePath,
+		FormulaSearchPaths: []string{filepath.Join(newPack, "formulas")},
+	}); err == nil {
+		t.Fatal("deleted formula provenance continued to trust the old-pin asset")
+	}
+}
+
+func TestRunRalphCheckPersistedFormulaSourceTrustsOnlySiblingAssets(t *testing.T) {
+	tmp := t.TempDir()
+	gcHome := filepath.Join(tmp, "gc-home")
+	t.Setenv("GC_HOME", gcHome)
+	pack := filepath.Join(gcHome, "cache", "repos", "old-pin", "packs", "fab-pack")
+	formulaSource := filepath.Join(pack, "formulas", "fab-build.formula.toml")
+	outsideAssetTree := filepath.Join(pack, "private", "check.sh")
+	for _, dir := range []string{filepath.Dir(formulaSource), filepath.Dir(outsideAssetTree), filepath.Join(tmp, "city"), filepath.Join(tmp, "rig")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(formulaSource, []byte("formula = \"fab-build\"\n"), 0o644); err != nil {
+		t.Fatalf("write formula source: %v", err)
+	}
+	if err := os.WriteFile(outsideAssetTree, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write unrelated script: %v", err)
+	}
+	store := beads.NewMemStore()
+	root := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "in-flight fab-build",
+		Type:  "task",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+			beadmeta.FormulaSourceMetadataKey:   formulaSource,
+		},
+	})
+	check := beads.Bead{ID: "check-outside-assets", Type: "task", Metadata: map[string]string{
+		beadmeta.CheckPathMetadataKey:  outsideAssetTree,
+		beadmeta.RootBeadIDMetadataKey: root.ID,
+	}}
+	subject := beads.Bead{ID: "run-outside-assets", Type: "task", Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: root.ID}}
+
+	if _, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath: filepath.Join(tmp, "city"), StorePath: filepath.Join(tmp, "rig"),
+	}); err == nil {
+		t.Fatal("persisted formula source trusted a script outside its sibling assets tree")
+	}
+}
+
+func TestTrustedWorkflowFormulaSourceRejectsRootProvenanceOutsideRepoCache(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("GC_HOME", filepath.Join(tmp, "gc-home"))
+	formulaSource := filepath.Join(tmp, "outside", "fab-pack", "formulas", "fab-build.formula.toml")
+	store := beads.NewMemStore()
+	root := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "untrusted workflow root",
+		Type:  "task",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+			beadmeta.FormulaSourceMetadataKey:   formulaSource,
+		},
+	})
+	child := beads.Bead{Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: root.ID}}
+
+	if got := trustedWorkflowFormulaSource(store, child); got != "" {
+		t.Fatalf("trustedWorkflowFormulaSource = %q, want empty for source outside the configured repo cache", got)
+	}
+}
+
+func TestRunRalphCheckRejectsCheckLocalFormulaSourceAsTrustProvenance(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	pack := filepath.Join(tmp, "cache", "untrusted", "fab-pack")
+	formulaSource := filepath.Join(pack, "formulas", "fab-build.formula.toml")
+	checkPath := filepath.Join(pack, "assets", "scripts", "check.sh")
+	for _, dir := range []string{filepath.Dir(formulaSource), filepath.Dir(checkPath), filepath.Join(tmp, "city"), filepath.Join(tmp, "rig")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(formulaSource, []byte("formula = \"fab-build\"\n"), 0o644); err != nil {
+		t.Fatalf("write formula source: %v", err)
+	}
+	if err := os.WriteFile(checkPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write check: %v", err)
+	}
+	store := beads.NewMemStore()
+	check := beads.Bead{ID: "check-local-provenance", Type: "task", Metadata: map[string]string{
+		beadmeta.CheckPathMetadataKey:     checkPath,
+		beadmeta.FormulaSourceMetadataKey: formulaSource,
+	}}
+	subject := beads.Bead{ID: "run-local-provenance", Type: "task"}
+
+	if _, err := runRalphCheck(store, check, subject, 1, ProcessOptions{
+		CityPath: filepath.Join(tmp, "city"), StorePath: filepath.Join(tmp, "rig"),
+	}); err == nil {
+		t.Fatal("check-local formula source metadata granted absolute-path trust")
+	}
+}
+
 // End-to-end for the templated ../assets check-path fix: an expansion formula
 // authored with "../assets/scripts/checks/{target}.sh" is deferred at parse
 // time, then resolved when runtime fan-out (CompileExpansionFragment)
