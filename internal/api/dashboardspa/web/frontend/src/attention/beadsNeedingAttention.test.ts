@@ -85,6 +85,20 @@ describe('selectBeadsNeedingAttention (gascity-dashboard-2j8e.3)', () => {
     expect(rows).toEqual([]);
   });
 
+  it('excludes an API-projected dependency-blocked bead whose status is still open', () => {
+    const rows = select({
+      beads: [
+        bead({
+          id: 'B-dep-projected-open',
+          status: 'open',
+          is_blocked: true,
+          created_at: '2026-06-01T11:00:00.000Z',
+        }),
+      ],
+    });
+    expect(rows).toEqual([]);
+  });
+
   it('excludes a closed (resolved) escalation', () => {
     const rows = select({
       escalations: [bead({ id: 'B-done', status: 'closed', labels: ['gc:escalation'] })],
