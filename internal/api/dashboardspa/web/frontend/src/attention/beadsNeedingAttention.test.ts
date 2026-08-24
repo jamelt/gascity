@@ -23,13 +23,28 @@ function select(inputs: { beads?: readonly Bead[]; escalations?: readonly Bead[]
 }
 
 describe('selectBeadsNeedingAttention (gascity-dashboard-2j8e.3)', () => {
-  it('includes a ready-unclaimed bead once it has aged past the watch window', () => {
+  it('includes aged ready-unclaimed beads when is_blocked is false or absent', () => {
     const rows = select({
-      beads: [bead({ id: 'B-ready', status: 'open', created_at: '2026-06-05T11:00:00.000Z' })],
+      beads: [
+        bead({
+          id: 'B-ready-false',
+          status: 'open',
+          is_blocked: false,
+          created_at: '2026-06-05T11:00:00.000Z',
+        }),
+        bead({
+          id: 'B-ready-absent',
+          status: 'open',
+          created_at: '2026-06-05T11:00:00.000Z',
+        }),
+      ],
     });
-    expect(rows).toEqual([
-      expect.objectContaining({ beadId: 'B-ready', reason: 'ready-unclaimed', severity: 'watch' }),
-    ]);
+    expect(rows.map((row) => row.beadId)).toEqual(['B-ready-false', 'B-ready-absent']);
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: 'ready-unclaimed', severity: 'watch' }),
+      ]),
+    );
   });
 
   it('escalates a long-stale ready-unclaimed bead to attention', () => {
@@ -78,9 +93,16 @@ describe('selectBeadsNeedingAttention (gascity-dashboard-2j8e.3)', () => {
     ]);
   });
 
-  it('excludes a plain dependency-blocked bead (working-as-intended queuing)', () => {
+  it('excludes an API-projected dependency-blocked bead whose status remains open', () => {
     const rows = select({
-      beads: [bead({ id: 'B-dep', status: 'blocked', created_at: '2026-06-01T11:00:00.000Z' })],
+      beads: [
+        bead({
+          id: 'B-dep',
+          status: 'open',
+          is_blocked: true,
+          created_at: '2026-06-01T11:00:00.000Z',
+        }),
+      ],
     });
     expect(rows).toEqual([]);
   });

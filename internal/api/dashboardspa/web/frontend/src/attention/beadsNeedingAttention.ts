@@ -91,7 +91,7 @@ function escalatedRow(bead: Bead): BeadAttentionRow | null {
 // `blocked` = "blocked by a dependency") and in-progress/closed work are not
 // surfaced — only genuinely-claimable open beads.
 function readyUnclaimedRow(bead: Bead, nowMs: number): BeadAttentionRow | null {
-  if (bead.status !== 'open' || hasAssignee(bead)) return null;
+  if (bead.status !== 'open' || bead.is_blocked === true || hasAssignee(bead)) return null;
   const ageMs = elapsedSince(bead.created_at, nowMs);
   if (ageMs === null || ageMs < READY_UNCLAIMED_WATCH_MS) return null;
   const stale = ageMs >= READY_UNCLAIMED_STALE_MS;
