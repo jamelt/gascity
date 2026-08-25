@@ -315,7 +315,7 @@ work_query = "printf '[{\"id\":\"ga-pool1\",\"status\":\"open\",\"title\":\"work
 func TestHookNoWork(t *testing.T) {
 	runner := func(string, string) (string, error) { return "", nil }
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", false, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", false, runner, &stdout, &stderr, hookVisibility{})
 	if code != 1 {
 		t.Errorf("doHook(no work) = %d, want 1", code)
 	}
@@ -327,7 +327,7 @@ func TestHookNoWork(t *testing.T) {
 func TestHookHasWork(t *testing.T) {
 	runner := func(string, string) (string, error) { return "hw-1  open  Fix the bug\n", nil }
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", false, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", false, runner, &stdout, &stderr, hookVisibility{})
 	if code != 0 {
 		t.Errorf("doHook(has work) = %d, want 0", code)
 	}
@@ -788,16 +788,19 @@ func TestDoHookClaimStampsWorkBranch(t *testing.T) {
 }
 
 // TestDoHookClaimSkipsStampWhenBranchUnchanged guards the idempotent path: a
-// claim whose bead already carries the resolved branch performs no stamp write.
+// claim whose bead already carries the resolved branch AND a prior
+// gc.claimed_at performs no stamp write. gc.claimed_at must be preset here too
+// (write-once): without it, this bead's "first claim" would always add the
+// key to the patch and falsely fail the "no write" assertion.
 func TestDoHookClaimSkipsStampWhenBranchUnchanged(t *testing.T) {
 	var stampCalls int
 	runner := func(string, string) (string, error) {
-		return `[{"id":"hw-idem","status":"open","metadata":{"gc.routed_to":"worker","gc.work_branch":"bd-hw-idem"}}]`, nil
+		return `[{"id":"hw-idem","status":"open","metadata":{"gc.routed_to":"worker","gc.work_branch":"bd-hw-idem","gc.claimed_at":"2026-01-01T00:00:00Z"}}]`, nil
 	}
 	ops := hookClaimOps{
 		Runner: runner,
 		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
-			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker", "gc.work_branch": "bd-hw-idem"}}, true, nil
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "worker", "gc.work_branch": "bd-hw-idem", "gc.claimed_at": "2026-01-01T00:00:00Z"}}, true, nil
 		},
 		ResolveWorkBranch: func(string) string { return "bd-hw-idem" },
 		StampWorkMeta: func(_ context.Context, _ string, _ []string, _, _ string, _ map[string]string) error {
@@ -1292,7 +1295,7 @@ func TestDoHookClaimPreassignsContinuationGroupSiblings(t *testing.T) {
 func TestHookCommandError(t *testing.T) {
 	runner := func(string, string) (string, error) { return "", fmt.Errorf("command failed") }
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", false, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", false, runner, &stdout, &stderr, hookVisibility{})
 	if code != 1 {
 		t.Errorf("doHook(error) = %d, want 1", code)
 	}
@@ -1306,7 +1309,7 @@ func TestHookCommandErrorPrintsPartialOutput(t *testing.T) {
 		return "[]\n", fmt.Errorf("timed out after 15s with partial stdout")
 	}
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", false, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", false, runner, &stdout, &stderr, hookVisibility{})
 	if code != 1 {
 		t.Errorf("doHook(error with output) = %d, want 1", code)
 	}
@@ -1338,7 +1341,7 @@ func TestShellWorkQueryWithEnvTimeoutReportsPartialOutput(t *testing.T) {
 func TestHookInjectNoWork(t *testing.T) {
 	runner := func(string, string) (string, error) { return "", nil }
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", true, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", true, runner, &stdout, &stderr, hookVisibility{})
 	if code != 0 {
 		t.Errorf("doHook(inject, no work) = %d, want 0", code)
 	}
@@ -1352,7 +1355,7 @@ func TestHookNoReadyMessagePrintsButExitsOne(t *testing.T) {
 		return "✨ No ready work found (all issues have blocking dependencies)\n", nil
 	}
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", false, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", false, runner, &stdout, &stderr, hookVisibility{})
 	if code != 1 {
 		t.Errorf("doHook(no-ready-message) = %d, want 1", code)
 	}
@@ -1366,7 +1369,7 @@ func TestHookInjectSuppressesNoReadyMessage(t *testing.T) {
 		return "✨ No ready work found (all issues have blocking dependencies)\n", nil
 	}
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", true, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", true, runner, &stdout, &stderr, hookVisibility{})
 	if code != 0 {
 		t.Errorf("doHook(inject, no-ready-message) = %d, want 0", code)
 	}
@@ -1378,7 +1381,7 @@ func TestHookInjectSuppressesNoReadyMessage(t *testing.T) {
 func TestHookInjectIsNonIntrusiveWithWork(t *testing.T) {
 	runner := func(string, string) (string, error) { return "hw-1  open  Fix the bug\n", nil }
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", true, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", true, runner, &stdout, &stderr, hookVisibility{})
 	if code != 0 {
 		t.Errorf("doHook(inject, work) = %d, want 0", code)
 	}
@@ -1394,7 +1397,7 @@ func TestHookInjectDoesNotRunWorkQuery(t *testing.T) {
 		return "hw-1  open  Fix the bug\n", nil
 	}
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", true, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", true, runner, &stdout, &stderr, hookVisibility{})
 	if code != 0 {
 		t.Errorf("doHook(inject, work) = %d, want 0", code)
 	}
@@ -2243,7 +2246,7 @@ func TestHookInjectAlwaysExitsZero(t *testing.T) {
 	// Even on command failure, inject mode exits 0.
 	runner := func(string, string) (string, error) { return "", fmt.Errorf("command failed") }
 	var stdout, stderr bytes.Buffer
-	code := doHook("bd ready", "", true, runner, &stdout, &stderr)
+	code := doHook("bd ready", "", true, runner, &stdout, &stderr, hookVisibility{})
 	if code != 0 {
 		t.Errorf("doHook(inject, error) = %d, want 0", code)
 	}
@@ -2258,7 +2261,7 @@ func TestHookPassesWorkQuery(t *testing.T) {
 		return "item-1\n", nil
 	}
 	var stdout, stderr bytes.Buffer
-	doHook("bd ready --assignee=mayor", "/tmp/work", false, runner, &stdout, &stderr)
+	doHook("bd ready --assignee=mayor", "/tmp/work", false, runner, &stdout, &stderr, hookVisibility{})
 	if receivedCmd != "bd ready --assignee=mayor" {
 		t.Errorf("runner command = %q, want %q", receivedCmd, "bd ready --assignee=mayor")
 	}
@@ -2908,7 +2911,7 @@ func TestDoHookNormalizesSingleObjectOutputToArray(t *testing.T) {
 		return `{"id":"bd-1","title":"Work"}`, nil
 	}
 
-	code := doHook("bd ready", ".", false, runner, &stdout, &stderr)
+	code := doHook("bd ready", ".", false, runner, &stdout, &stderr, hookVisibility{})
 	if code != 0 {
 		t.Fatalf("doHook() = %d, want 0; stderr=%s", code, stderr.String())
 	}
