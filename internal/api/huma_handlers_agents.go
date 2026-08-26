@@ -54,6 +54,10 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 	// name (nil on a single-store city). Computed after the cache-hit return
 	// so a cached response never pays for the graph-store list.
 	graphWork := s.graphActiveWorkBySession()
+	// Session beads are the source of truth for provider runtime names. In
+	// particular, transient bounded-pool slots intentionally step aside to a
+	// "-pool" name that cannot be reconstructed with agentSessionName.
+	sessionSnapshot := s.statusSessionSnapshot(ctx)
 
 	// Optional batch extensions: providers whose per-session attribute reads
 	// are otherwise expensive (e.g. one subprocess fork per call, per agent)
@@ -84,7 +88,7 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 				continue
 			}
 
-			sessionName := agentSessionName(cityName, ea.qualifiedName, sessTmpl)
+			sessionName := agentSessionNameFromSnapshot(sessionSnapshot, cityName, ea.qualifiedName, sessTmpl)
 			// Liveness stays on IsRunning: it is already a cached,
 			// fleet-wide read that excludes pane_dead corpses, whereas
 			// roster membership comes from list-sessions, which still
@@ -233,20 +237,20 @@ func (s *Server) humaHandleAgentList(ctx context.Context, input *AgentListInput)
 
 // humaHandleAgent is the Huma-typed handler for
 // GET /v0/city/{cityName}/agent/{base} (unqualified form).
-func (s *Server) humaHandleAgent(_ context.Context, input *AgentGetInput) (*IndexOutput[agentResponse], error) {
-	return s.agentByName(input.Name)
+func (s *Server) humaHandleAgent(ctx context.Context, input *AgentGetInput) (*IndexOutput[agentResponse], error) {
+	return s.agentByName(ctx, input.Name)
 }
 
 // humaHandleAgentQualified is the Huma-typed handler for
 // GET /v0/city/{cityName}/agent/{dir}/{base} (qualified form).
-func (s *Server) humaHandleAgentQualified(_ context.Context, input *AgentGetQualifiedInput) (*IndexOutput[agentResponse], error) {
-	return s.agentByName(input.QualifiedName())
+func (s *Server) humaHandleAgentQualified(ctx context.Context, input *AgentGetQualifiedInput) (*IndexOutput[agentResponse], error) {
+	return s.agentByName(ctx, input.QualifiedName())
 }
 
 // agentByName is the shared agent-get implementation. Both the qualified
 // and unqualified routes normalize to a single "name" string before
 // dispatching here.
-func (s *Server) agentByName(name string) (*IndexOutput[agentResponse], error) {
+func (s *Server) agentByName(ctx context.Context, name string) (*IndexOutput[agentResponse], error) {
 	if name == "" {
 		return nil, apierr.InvalidRequest.Msg("agent name required")
 	}
@@ -260,7 +264,7 @@ func (s *Server) agentByName(name string) (*IndexOutput[agentResponse], error) {
 		return nil, apierr.AgentNotFound.Msg("agent " + name + " not found")
 	}
 
-	sessionName := agentSessionName(cityName, name, cfg.Workspace.SessionTemplate)
+	sessionName := agentSessionNameFromSnapshot(s.statusSessionSnapshot(ctx), cityName, name, cfg.Workspace.SessionTemplate)
 	running := sp.IsRunning(sessionName)
 	// Fold active graph-resident (wisp) work into the running signal so a
 	// graph-working agent reports running even when its named provider session

@@ -27,11 +27,12 @@ function agent(overrides: Partial<AgentResponse>): AgentResponse {
 const liveSession = { attached: true, last_activity: '2026-06-01T11:59:00.000Z', name: 'agent' };
 
 describe('selectAgentsNeedingYou', () => {
-  test('does NOT count actively-running, idle, asleep, or suspended agents', () => {
+  test('does NOT count active, idle, waiting, asleep, or suspended agents', () => {
     const result = selectAgentsNeedingYou(
       [
         agent({ name: 'running', running: true, state: 'active', session: liveSession }),
         agent({ name: 'idle', state: 'idle', session: liveSession }),
+        agent({ name: 'waiting', running: true, state: 'waiting', session: liveSession }),
         agent({ name: 'asleep', running: true, state: 'asleep', session: liveSession }),
         agent({ name: 'suspended', suspended: true, state: 'active', session: liveSession }),
         agent({ name: 'unavailable', available: false, state: 'idle' }),
@@ -82,7 +83,7 @@ describe('selectAgentsNeedingYou', () => {
     const result = selectAgentsNeedingYou(
       [
         agent({ name: 'crashed', state: 'errored' }),
-        agent({ name: 'throttled', running: true, state: 'waiting', session: liveSession }),
+        agent({ name: 'throttled', running: true, state: 'rate_limited', session: liveSession }),
         agent({ name: 'ghost', running: true, state: 'running' }),
       ],
       [],

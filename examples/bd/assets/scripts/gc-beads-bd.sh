@@ -2485,9 +2485,9 @@ run_bd_init_pinned() {
     local prefix="$2"
     local dolt_database="$3"
     local host="$4"
-    local force_init="${5:-false}"
-    if [ "$force_init" = "true" ]; then
-        run_bd_pinned "$dir" init --force --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+    local reinit_local="${5:-false}"
+    if [ "$reinit_local" = "true" ]; then
+        run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
             --server-host "$host" --server-port "$DOLT_PORT" "$dir" || die "bd init failed for $dir"
         return 0
     fi
@@ -2656,7 +2656,7 @@ op_init() {
     local metadata_path="$dir/.beads/metadata.json"
     local existing_db=""
     local allow_reserved_existing=false
-    local bd_init_force=""
+    local bd_init_reinit=""
     if [ -z "$dir" ] || [ -z "$prefix" ]; then
         die "usage: gc-beads-bd init <dir> <prefix> [dolt_database]"
     fi
@@ -2772,25 +2772,26 @@ op_init() {
     # fresh init also reaches this branch — that is intentional. The branch
     # does NOT blindly skip init: it only exits early when the server already
     # has a live bd schema (bd_runtime_schema_ready). Otherwise it sets
-    # bd_init_force="--force" so the fall-through bd init reinitializes over
+    # bd_init_reinit="--reinit-local" so the fall-through bd init reinitializes over
     # the gc-pre-seeded metadata stub instead of aborting with bd's "This
     # workspace is already initialized" guard. Gating this branch on project_id
     # instead breaks fresh init: gc-pre-seeded metadata has no project_id, so
-    # --force is never set and bd init aborts.
+    # --reinit-local is never set and bd init aborts.
     if [ -f "$dir/.beads/metadata.json" ]; then
         # A pre-existing metadata.json means the store may already be
         # initialized. Both checks below run SQL against the managed Dolt
         # server, so a transient server-unreachable blip (port drift, an
         # exclusive lock held by a stale dolt process, a slow server start)
         # is indistinguishable from "schema missing" / "not registered" —
-        # and both of those branches react by forcing a DESTRUCTIVE reinit
-        # (--force), which trips bd's remote-history guard and aborts city
-        # init on an otherwise healthy store. Confirm the server actually
+        # and both of those branches react by requesting a local reinit, which
+        # must never run unless the server is reachable and schema absence is
+        # proven. Otherwise a transient read failure could destroy live state.
+        # Confirm the server actually
         # answers before trusting a negative result; otherwise fail closed
         # so the caller's retry loop waits for the server to come up instead
         # of reinitializing live data.
         if ! server_reachable; then
-            die "managed Dolt server unreachable while inspecting existing store '$dolt_database'; refusing to force-reinitialize (data-safety). retry once the Dolt server is reachable."
+            die "managed Dolt server unreachable while inspecting existing store '$dolt_database'; refusing to locally reinitialize (data-safety). retry once the Dolt server is reachable."
         fi
         if ensure_database_registered "$dolt_database"; then
             if bd_runtime_schema_ready "$dolt_database"; then
@@ -2805,10 +2806,10 @@ op_init() {
                 exit 0
             fi
             echo "warning: database '$dolt_database' missing bd schema; re-initializing" >&2
-            bd_init_force="--force"
+            bd_init_reinit="--reinit-local"
         else
             echo "warning: database '$dolt_database' not registered; re-initializing" >&2
-            bd_init_force="--force"
+            bd_init_reinit="--reinit-local"
         fi
     fi
 
@@ -2832,12 +2833,12 @@ op_init() {
     # Run bd init in server mode through the pinned wrapper so the fallback
     # path uses the same authenticated Dolt target as the rest of init.
     # Metadata-only scopes already look initialized to bd, so schema-repair
-    # fallback must force reinit to seed the missing tables into the pinned DB.
+    # fallback must locally reinitialize to seed missing tables into the pinned DB.
     # Always pass the pinned server database explicitly; `-p` controls the
     # visible issue prefix, while `--database` tells bd which existing Dolt
     # database to initialize. Without `--database`, bd can seed beads_<prefix>
     # and leave the pinned database schema-less.
-    run_bd_init_pinned "$dir" "$prefix" "$dolt_database" "$host" "${bd_init_force:+true}"
+    run_bd_init_pinned "$dir" "$prefix" "$dolt_database" "$host" "${bd_init_reinit:+true}"
 
     # Re-register post-init: if bd init didn't catalog-register the DB
     # (server-mode quirk), do it now. After a successful bd init this is a
@@ -2853,8 +2854,8 @@ op_init() {
     ensure_beads_dir_permissions "$dir"
     if ! wait_for_bd_runtime_schema "$dolt_database"; then
         if [ "${GC_BD_INIT_RETRY:-0}" != "1" ]; then
-            if [ -n "$bd_init_force" ]; then
-                # Metadata-only scopes can still confuse bd's first forced server init.
+            if [ -n "$bd_init_reinit" ]; then
+                # Metadata-only scopes can still confuse bd's first local server reinit.
                 # Drop the preseeded metadata and retry through a fresh top-level
                 # invocation, matching the successful manual recovery path.
                 rm -f "$dir/.beads/metadata.json"

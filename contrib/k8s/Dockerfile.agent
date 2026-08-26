@@ -19,16 +19,16 @@ ARG BASE_IMAGE=gc-agent-base:latest
 
 FROM golang:1.26.6-bookworm@sha256:433f9dc4f8ea3a1ce4e28f9f15d0f7c056b10475307f886d6f1ac1ccc4abd976 AS bd-builder
 
-ARG BD_VERSION=v1.1.0
-ARG BD_SOURCE_REF=bf97b73749ac3ef2fca2365b54537ac041ad4293
-ARG BD_SOURCE_SHA256=a8b1d8dd85b2c008093615cb85937067a9597e760e8d39f93fe55f5c1cbb4d37
-ARG BD_BUILD=bf97b73749
+ARG BD_VERSION=v1.2.2
+ARG BD_SOURCE_REF=997fac3b784488bb3551c730c19e71295855f11a
+ARG BD_SOURCE_SHA256=e3289b9c8100347c97c60585f39a9ad8ab5905d73e4c4361883839ba8e5a98b0
+ARG BD_BUILD=997fac3b78
 ARG BD_BRANCH=HEAD
-ARG GRPC_VERSION=1.82.1
+ARG GRPC_VERSION=1.83.0
 
-# The published bd 1.1.0 binary embeds vulnerable grpc-go 1.80.0. Rebuild the
-# exact released source with its production CGO/pure-Go-regex configuration and
-# release identity, changing only the patched dependency version.
+# The published bd binary predates the conditional-write source cell used by
+# Gas City's native-store contract. Build that pinned source with its production
+# CGO/pure-Go-regex configuration and the patched dependency version.
 RUN mkdir -p /src/bd /out \
     && curl -fsSL --retry 3 \
        "https://github.com/gastownhall/beads/archive/${BD_SOURCE_REF}.tar.gz" \

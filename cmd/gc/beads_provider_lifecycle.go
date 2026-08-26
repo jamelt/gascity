@@ -328,6 +328,12 @@ func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 }
 
 func initDirIfReadyManagedDolt(cityPath, dir, prefix, _ string) error {
+	// Seed canonical metadata and bd's current-layout witness before the
+	// provider creates a local Dolt root. Once that root exists, a missing
+	// witness must be treated as potentially legacy and cannot be inferred.
+	if err := seedDeferredManagedBeadsErr(cityPath, dir, prefix, ""); err != nil {
+		return err
+	}
 	if err := initDirIfReadyEnsureBeadsProvider(cityPath); err != nil {
 		return fmt.Errorf("bead store: %w", err)
 	}
@@ -445,6 +451,10 @@ func seedDeferredManagedBeadsErr(cityPath, dir, prefix, doltDatabase string) err
 	} else if skipsManagedDolt {
 		return nil
 	}
+	freshScope, err := scopeCanSeedFreshBdLocalVersion(dir)
+	if err != nil {
+		return err
+	}
 	if state, ok, err := desiredScopeDoltConfigStateForInit(cityPath, dir, prefix); err != nil {
 		return err
 	} else if ok {
@@ -455,7 +465,59 @@ func seedDeferredManagedBeadsErr(cityPath, dir, prefix, doltDatabase string) err
 	if strings.TrimSpace(doltDatabase) == "" {
 		doltDatabase = readDeferredManagedDoltDatabase(filepath.Join(dir, ".beads", "metadata.json"), defaultScopeDoltDatabase(cityPath, dir, prefix))
 	}
-	return ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, dir, doltDatabase)
+	if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, dir, doltDatabase); err != nil {
+		return err
+	}
+	return seedFreshBdLocalVersion(dir, freshScope)
+}
+
+// scopeCanSeedFreshBdLocalVersion identifies only a truly new local scope.
+// A missing metadata file by itself is not sufficient: a metadata-less Dolt
+// root can contain legacy data that the bd migration guard must inspect. Gas
+// City may seed the current-layout witness only before either artifact exists.
+func scopeCanSeedFreshBdLocalVersion(scopeRoot string) (bool, error) {
+	for _, path := range []string{
+		filepath.Join(scopeRoot, ".beads", "metadata.json"),
+		filepath.Join(scopeRoot, ".beads", ".local_version"),
+		filepath.Join(scopeRoot, ".beads", "dolt"),
+	} {
+		if _, err := os.Lstat(path); err == nil {
+			return false, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("inspect fresh bd scope artifact %s: %w", path, err)
+		}
+	}
+	return true, nil
+}
+
+const freshBdLocalLayoutVersion = "1.0.0"
+
+// seedFreshBdLocalVersion bridges Gas City's pre-seeded server metadata with
+// bd's v1+ legacy-workspace guard. The file is created only for a scope proven
+// fresh before metadata creation; existing and legacy workspaces are never
+// stamped or overwritten. The bootstrap value denotes the v1 local-layout
+// epoch, not a claim about the installed CLI patch version; bd replaces it
+// with its exact version as soon as command setup proceeds past the guard.
+func seedFreshBdLocalVersion(scopeRoot string, fresh bool) error {
+	if !fresh {
+		return nil
+	}
+	path := filepath.Join(scopeRoot, ".beads", ".local_version")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- canonical file beneath the selected scope
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create fresh bd local layout witness: %w", err)
+	}
+	if _, err := io.WriteString(f, freshBdLocalLayoutVersion+"\n"); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write fresh bd local layout witness: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close fresh bd local layout witness: %w", err)
+	}
+	return nil
 }
 
 func readDeferredManagedDoltDatabase(path, fallback string) string {

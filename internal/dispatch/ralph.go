@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -134,13 +135,21 @@ func processRalphCheck(store beads.Store, bead beads.Bead, opts ProcessOptions) 
 		}); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: marking logical hard failure: %w", logicalID, err)
 		}
+		preSkipped, err := skipLogicalWorkflowFailureDependents(store, logicalID, opts)
+		if err != nil {
+			return ControlResult{}, fmt.Errorf("%s: propagating logical hard failure: %w", logicalID, err)
+		}
 		if err := setOutcomeAndClose(store, bead.ID, beadmeta.OutcomeFail); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: closing hard-failed check: %w", bead.ID, err)
 		}
 		if err := setOutcomeAndClose(store, logicalID, beadmeta.OutcomeFail); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: closing hard-failed logical bead: %w", logicalID, err)
 		}
-		return ControlResult{Processed: true, Action: "hard-fail"}, nil
+		scopeResult, err := reconcileClosedScopeMemberWithOptions(store, logicalID, opts)
+		if err != nil {
+			return ControlResult{}, fmt.Errorf("%s: reconciling terminal logical failure: %w", logicalID, err)
+		}
+		return ControlResult{Processed: true, Action: "hard-fail", Skipped: preSkipped + scopeResult.Skipped}, nil
 	}
 
 	if attempt >= maxAttempts {
@@ -150,13 +159,21 @@ func processRalphCheck(store beads.Store, bead beads.Bead, opts ProcessOptions) 
 		}); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: marking logical failure: %w", logicalID, err)
 		}
+		preSkipped, err := skipLogicalWorkflowFailureDependents(store, logicalID, opts)
+		if err != nil {
+			return ControlResult{}, fmt.Errorf("%s: propagating exhausted logical failure: %w", logicalID, err)
+		}
 		if err := setOutcomeAndClose(store, bead.ID, beadmeta.OutcomeFail); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: closing failed check: %w", bead.ID, err)
 		}
 		if err := setOutcomeAndClose(store, logicalID, beadmeta.OutcomeFail); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: closing failed logical bead: %w", logicalID, err)
 		}
-		return ControlResult{Processed: true, Action: "fail"}, nil
+		scopeResult, err := reconcileClosedScopeMemberWithOptions(store, logicalID, opts)
+		if err != nil {
+			return ControlResult{}, fmt.Errorf("%s: reconciling terminal logical failure: %w", logicalID, err)
+		}
+		return ControlResult{Processed: true, Action: "fail", Skipped: preSkipped + scopeResult.Skipped}, nil
 	}
 
 	nextAttempt := attempt + 1
@@ -259,7 +276,8 @@ func runRalphCheck(store beads.Store, bead, subject beads.Bead, attempt int, opt
 	// gastownhall/gascity#2320 storePath (a rig subtree) was passed as both,
 	// causing relative gc.check_path values to be looked up under the rig
 	// tree even when the script lives in the city tree.
-	trustedAbsRoots := ralphCheckTrustedAbsoluteRoots(cityPath, storePath, opts.FormulaSearchPaths)
+	formulaSource := trustedWorkflowFormulaSource(store, bead, subject)
+	trustedAbsRoots := ralphCheckTrustedAbsoluteRoots(cityPath, storePath, opts.FormulaSearchPaths, formulaSource)
 	if filepath.IsAbs(checkPath) && !pathWithinAny(checkPath, trustedAbsRoots) {
 		return convergence.GateResult{}, fmt.Errorf("%s: absolute gc.check_path %q escapes trusted roots", bead.ID, checkPath)
 	}
@@ -335,8 +353,8 @@ func runRalphCheck(store beads.Store, bead, subject beads.Bead, attempt int, opt
 	return result, nil
 }
 
-func ralphCheckTrustedAbsoluteRoots(cityPath, storePath string, formulaSearchPaths []string) []string {
-	roots := make([]string, 0, 2+3*len(formulaSearchPaths))
+func ralphCheckTrustedAbsoluteRoots(cityPath, storePath string, formulaSearchPaths []string, formulaSource string) []string {
+	roots := make([]string, 0, 3+3*len(formulaSearchPaths))
 	add := func(root string) {
 		root = strings.TrimSpace(root)
 		if root == "" {
@@ -369,7 +387,48 @@ func ralphCheckTrustedAbsoluteRoots(cityPath, storePath string, formulaSearchPat
 			add(filepath.Dir(clean))
 		}
 	}
+	// An in-flight workflow retains the compiler-recorded formula source that
+	// produced its absolute ../assets check path. A pack reload may move the active
+	// FormulaSearchPaths to a new cache entry before that workflow reaches its
+	// check. Trust only the persisted source's sibling assets/ directory — not
+	// its whole pack or the cache root — and only while the recorded source file
+	// still exists. This preserves old-pin execution without turning arbitrary
+	// absolute paths in bead metadata into trusted scripts.
+	formulaSource = strings.TrimSpace(formulaSource)
+	if filepath.IsAbs(formulaSource) {
+		if info, err := os.Stat(formulaSource); err == nil && !info.IsDir() {
+			add(filepath.Join(filepath.Dir(filepath.Dir(formulaSource)), "assets"))
+		}
+	}
 	return roots
+}
+
+// trustedWorkflowFormulaSource returns compiler provenance only from the
+// authoritative graph root and only while it names Gas City's configured,
+// operator-controlled content-addressed repo cache.
+func trustedWorkflowFormulaSource(store beads.Store, candidates ...beads.Bead) string {
+	repoCacheRoot, err := config.GlobalRepoCacheRoot()
+	if err != nil {
+		return ""
+	}
+	for _, candidate := range candidates {
+		rootID := strings.TrimSpace(candidate.Metadata[beadmeta.RootBeadIDMetadataKey])
+		if rootID == "" {
+			continue
+		}
+		root, err := store.Get(rootID)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(root.Metadata[beadmeta.KindMetadataKey]) != beadmeta.KindWorkflow ||
+			strings.TrimSpace(root.Metadata[beadmeta.FormulaContractMetadataKey]) != beadmeta.FormulaContractGraphV2 {
+			continue
+		}
+		if source := strings.TrimSpace(root.Metadata[beadmeta.FormulaSourceMetadataKey]); filepath.IsAbs(source) && pathutil.PathWithin(repoCacheRoot, source) {
+			return source
+		}
+	}
+	return ""
 }
 
 func pathWithinAny(path string, roots []string) bool {

@@ -371,6 +371,28 @@ func TestBdStoreGet(t *testing.T) {
 	}
 }
 
+func TestBdStoreGetAcceptsBareIssueObject(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json bd-abc-123`: {
+			out: []byte(`{"id":"bd-abc-123","title":"Build a widget","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","assignee":"alice"}`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	b, err := s.Get("bd-abc-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.ID != "bd-abc-123" {
+		t.Errorf("ID = %q, want %q", b.ID, "bd-abc-123")
+	}
+	if b.Assignee != "alice" {
+		t.Errorf("Assignee = %q, want %q", b.Assignee, "alice")
+	}
+}
+
 func TestBdStoreGetFallsBackToEphemeralForWisps(t *testing.T) {
 	// bd show does not query the wisps table, so Get for a wisp ID returns
 	// ErrNotFound from bd show. Get must fall back to bd query with

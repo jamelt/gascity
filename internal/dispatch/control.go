@@ -168,6 +168,10 @@ func processAttemptControl(store beads.Store, bead beads.Bead, opts ProcessOptio
 		return ControlResult{Processed: true, Action: "pass", Skipped: scopeResult.Skipped}, nil
 
 	case attemptHardFail:
+		preSkipped, err := skipTopLevelWorkflowFailureDependents(store, bead, opts)
+		if err != nil {
+			return ControlResult{}, fmt.Errorf("%s: propagating terminal hard failure: %w", bead.ID, err)
+		}
 		closeMetadata := map[string]string{
 			beadmeta.AttemptLogMetadataKey:       attemptLog,
 			beadmeta.OutcomeMetadataKey:          beadmeta.OutcomeFail,
@@ -184,10 +188,14 @@ func processAttemptControl(store beads.Store, bead beads.Bead, opts ProcessOptio
 		if err != nil {
 			return ControlResult{}, fmt.Errorf("%s: reconciling enclosing scope: %w", bead.ID, err)
 		}
-		return ControlResult{Processed: true, Action: "hard-fail", Skipped: scopeResult.Skipped}, nil
+		return ControlResult{Processed: true, Action: "hard-fail", Skipped: preSkipped + scopeResult.Skipped}, nil
 
 	case attemptContinue:
 		if attemptNum >= maxAttempts {
+			preSkipped, err := skipTopLevelWorkflowFailureDependents(store, bead, opts)
+			if err != nil {
+				return ControlResult{}, fmt.Errorf("%s: propagating exhausted failure: %w", bead.ID, err)
+			}
 			exhaustedResult, err := strategy.exhaust(store, bead.ID, attemptNum, eval.reason, attemptLog)
 			if err != nil {
 				return ControlResult{}, err
@@ -196,7 +204,7 @@ func processAttemptControl(store beads.Store, bead beads.Bead, opts ProcessOptio
 			if err != nil {
 				return ControlResult{}, fmt.Errorf("%s: reconciling enclosing scope: %w", bead.ID, err)
 			}
-			exhaustedResult.Skipped += scopeResult.Skipped
+			exhaustedResult.Skipped += preSkipped + scopeResult.Skipped
 			return exhaustedResult, nil
 		}
 

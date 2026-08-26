@@ -95,13 +95,21 @@ func processRetryEval(store beads.Store, bead beads.Bead, opts ProcessOptions) (
 		}); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: marking logical hard failure: %w", logicalID, err)
 		}
+		preSkipped, err := skipLogicalWorkflowFailureDependents(store, logicalID, opts)
+		if err != nil {
+			return ControlResult{}, fmt.Errorf("%s: propagating logical hard failure: %w", logicalID, err)
+		}
 		if err := setOutcomeAndClose(store, bead.ID, beadmeta.OutcomeFail); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: closing hard-failed eval: %w", bead.ID, err)
 		}
 		if err := setOutcomeAndClose(store, logicalID, beadmeta.OutcomeFail); err != nil {
 			return ControlResult{}, fmt.Errorf("%s: closing hard-failed logical bead: %w", logicalID, err)
 		}
-		return ControlResult{Processed: true, Action: "hard-fail"}, nil
+		scopeResult, err := reconcileClosedScopeMemberWithOptions(store, logicalID, opts)
+		if err != nil {
+			return ControlResult{}, fmt.Errorf("%s: reconciling terminal logical failure: %w", logicalID, err)
+		}
+		return ControlResult{Processed: true, Action: "hard-fail", Skipped: preSkipped + scopeResult.Skipped}, nil
 
 	case "canceled":
 		// The run was canceled: close the eval and its logical bead as canceled
@@ -146,13 +154,21 @@ func processRetryEval(store beads.Store, bead beads.Bead, opts ProcessOptions) (
 			}); err != nil {
 				return ControlResult{}, fmt.Errorf("%s: marking exhausted logical failure: %w", logicalID, err)
 			}
+			preSkipped, err := skipLogicalWorkflowFailureDependents(store, logicalID, opts)
+			if err != nil {
+				return ControlResult{}, fmt.Errorf("%s: propagating exhausted logical failure: %w", logicalID, err)
+			}
 			if err := setOutcomeAndClose(store, bead.ID, beadmeta.OutcomeFail); err != nil {
 				return ControlResult{}, fmt.Errorf("%s: closing exhausted eval: %w", bead.ID, err)
 			}
 			if err := setOutcomeAndClose(store, logicalID, beadmeta.OutcomeFail); err != nil {
 				return ControlResult{}, fmt.Errorf("%s: closing exhausted logical bead: %w", logicalID, err)
 			}
-			return ControlResult{Processed: true, Action: "fail"}, nil
+			scopeResult, err := reconcileClosedScopeMemberWithOptions(store, logicalID, opts)
+			if err != nil {
+				return ControlResult{}, fmt.Errorf("%s: reconciling terminal logical failure: %w", logicalID, err)
+			}
+			return ControlResult{Processed: true, Action: "fail", Skipped: preSkipped + scopeResult.Skipped}, nil
 		}
 	default:
 		return ControlResult{}, fmt.Errorf("%s: unsupported retry eval outcome %q", bead.ID, result.Outcome)

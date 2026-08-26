@@ -77,14 +77,19 @@ type stopCommandOutcome struct {
 }
 
 func cmdStopJSON(args []string, stdout, stderr io.Writer, wallClockTimeout time.Duration, force bool, jsonOut bool) int {
+	unregisterTx := newSupervisorUnregisterTransaction()
 	var outcome stopCommandOutcome
 	if wallClockTimeout > 0 {
-		unregisterTx := newSupervisorUnregisterTransaction()
 		outcome = runStopWithWallClockCap(wallClockTimeout, stderr, unregisterTx, func() stopCommandOutcome {
 			return cmdStopJSONSequence(args, stdout, stderr, force, jsonOut, true, unregisterTx)
 		})
 	} else {
-		outcome = cmdStopJSONSequence(args, stdout, stderr, force, jsonOut, false, nil)
+		outcome = cmdStopJSONSequence(args, stdout, stderr, force, jsonOut, false, unregisterTx)
+		if outcome.code == 0 {
+			unregisterTx.commit()
+		} else {
+			writeSupervisorUnregisterRollback(stderr, "gc stop", "stop failed after unregistering city", unregisterTx.rollback())
+		}
 	}
 	if outcome.code != 0 {
 		return outcome.code
@@ -142,7 +147,7 @@ func cmdStopJSONSequence(args []string, stdout, stderr io.Writer, force bool, js
 	if wallClockCapApplied {
 		return stopLoadedCity()
 	}
-	return runStopWithWallClockCap(defaultStopWallClockTimeout(cfg), stderr, nil, stopLoadedCity)
+	return runStopWithWallClockCap(defaultStopWallClockTimeout(cfg), stderr, unregisterTx, stopLoadedCity)
 }
 
 func runStopWithWallClockCap(wallClockCap time.Duration, stderr io.Writer, unregisterTx *supervisorUnregisterTransaction, stop func() stopCommandOutcome) stopCommandOutcome {

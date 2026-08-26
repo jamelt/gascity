@@ -1,6 +1,7 @@
 package dolt_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -4690,6 +4691,110 @@ func TestBackupScriptDiscoversNamedBackupsAndSyncsArtifactsOffsite(t *testing.T)
 	if strings.Contains(string(rsyncLog), dataDir+"/") {
 		t.Fatalf("rsync must not use live data dir, log:\n%s", rsyncLog)
 	}
+}
+
+func TestBackupScriptRecordsFreshnessOnlyAfterCompleteSync(t *testing.T) {
+	t.Run("complete sync atomically records a Reaper-compatible timestamp", func(t *testing.T) {
+		cityPath := t.TempDir()
+		dataDir := filepath.Join(cityPath, "dolt-data")
+		if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+			t.Fatalf("mkdir db: %v", err)
+		}
+		binDir := t.TempDir()
+		_ = writeDogFakeGC(t, binDir)
+		_ = writeBackupFakeDolt(t, binDir, "2.1.0", 0)
+
+		runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir, "GC_BACKUP_DATABASES=prod")
+
+		statePath := filepath.Join(cityPath, ".beads", "backup", "backup_state.json")
+		data, err := os.ReadFile(statePath)
+		if err != nil {
+			t.Fatalf("read backup freshness state: %v", err)
+		}
+		var state struct {
+			Timestamp string `json:"timestamp"`
+			Source    string `json:"source"`
+			Synced    int    `json:"synced"`
+			Total     int    `json:"total"`
+		}
+		if err := json.Unmarshal(data, &state); err != nil {
+			t.Fatalf("parse backup freshness state: %v\n%s", err, data)
+		}
+		if _, err := time.Parse(time.RFC3339, state.Timestamp); err != nil {
+			t.Fatalf("timestamp %q is not RFC3339: %v", state.Timestamp, err)
+		}
+		if state.Source != "mol-dog-backup" || state.Synced != 1 || state.Total != 1 {
+			t.Fatalf("unexpected backup freshness state: %+v", state)
+		}
+		matches, err := filepath.Glob(filepath.Join(filepath.Dir(statePath), ".backup_state.json.tmp.*"))
+		if err != nil {
+			t.Fatalf("glob temporary freshness states: %v", err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("temporary freshness state left behind: %v", matches)
+		}
+	})
+
+	t.Run("failed sync preserves the prior watermark", func(t *testing.T) {
+		cityPath := t.TempDir()
+		dataDir := filepath.Join(cityPath, "dolt-data")
+		statePath := filepath.Join(cityPath, ".beads", "backup", "backup_state.json")
+		if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+			t.Fatalf("mkdir db: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+			t.Fatalf("mkdir backup state dir: %v", err)
+		}
+		const prior = `{"timestamp":"2026-01-02T03:04:05Z","source":"prior"}`
+		if err := os.WriteFile(statePath, []byte(prior), 0o644); err != nil {
+			t.Fatalf("write prior backup freshness state: %v", err)
+		}
+		binDir := t.TempDir()
+		_ = writeDogFakeGC(t, binDir)
+		_ = writeBackupFakeDolt(t, binDir, "2.1.0", 1)
+
+		out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir, "GC_BACKUP_DATABASES=prod")
+		if !strings.Contains(out, "synced: 0/1") {
+			t.Fatalf("unexpected failed-sync summary:\n%s", out)
+		}
+		data, err := os.ReadFile(statePath)
+		if err != nil {
+			t.Fatalf("read preserved backup freshness state: %v", err)
+		}
+		if string(data) != prior {
+			t.Fatalf("failed sync changed backup freshness state:\n got: %s\nwant: %s", data, prior)
+		}
+	})
+
+	t.Run("watermark write failure fails the backup order", func(t *testing.T) {
+		cityPath := t.TempDir()
+		dataDir := filepath.Join(cityPath, "dolt-data")
+		if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+			t.Fatalf("mkdir db: %v", err)
+		}
+		blockedParent := filepath.Join(cityPath, "freshness-parent-is-a-file")
+		if err := os.WriteFile(blockedParent, []byte("not a directory"), 0o644); err != nil {
+			t.Fatalf("write blocked freshness parent: %v", err)
+		}
+		statePath := filepath.Join(blockedParent, "backup_state.json")
+		binDir := t.TempDir()
+		_ = writeDogFakeGC(t, binDir)
+		_ = writeBackupFakeDolt(t, binDir, "2.1.0", 0)
+
+		out, err := runDogScriptCommand(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+			"GC_BACKUP_DATABASES=prod",
+			"GC_BACKUP_FRESHNESS_STATE="+statePath,
+		)
+		if err == nil {
+			t.Fatalf("backup unexpectedly succeeded when freshness watermark could not be written:\n%s", out)
+		}
+		if !strings.Contains(out, "freshness: write-failed") {
+			t.Fatalf("backup did not report freshness watermark failure:\n%s", out)
+		}
+		if _, statErr := os.Stat(statePath); statErr == nil {
+			t.Fatalf("freshness watermark unexpectedly exists at %s", statePath)
+		}
+	})
 }
 
 func TestBackupScriptSkipsConcurrentRunBeforeBackupSync(t *testing.T) {

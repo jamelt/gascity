@@ -16,6 +16,7 @@ HOST="${GC_DOLT_HOST:-127.0.0.1}"
 USER="${GC_DOLT_USER:-root}"
 OFFSITE_PATH="${GC_BACKUP_OFFSITE_PATH:-}"
 BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
+BACKUP_FRESHNESS_STATE="${GC_BACKUP_FRESHNESS_STATE:-$GC_CITY_PATH/.beads/backup/backup_state.json}"
 SYSTEM_DBS="^(information_schema|mysql|dolt_cluster|__gc_probe|performance_schema|sys)$"
 MIN_DOLT_BACKUP_VERSION="2.1.0"
 BACKUP_LOCK_FILE="${GC_DOLT_BACKUP_LOCK_FILE:-$GC_CITY_PATH/.gc/runtime/packs/dolt/backup-sync.lock}"
@@ -95,6 +96,28 @@ acquire_backup_lock() {
         dolt_notify_done "$SUMMARY"
         echo "backup: $SUMMARY"
         exit 0
+    fi
+}
+
+# record_backup_freshness publishes the Reaper bulk-delete safety watermark.
+# The state is written only after every discovered database has synced, and is
+# replaced atomically so readers never observe a partial JSON document.
+record_backup_freshness() {
+    freshness_dir=$(dirname "$BACKUP_FRESHNESS_STATE")
+    mkdir -p "$freshness_dir" || return 1
+    freshness_tmp=$(mktemp "$freshness_dir/.backup_state.json.tmp.XXXXXX") || return 1
+    freshness_timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || {
+        rm -f -- "$freshness_tmp"
+        return 1
+    }
+    if ! printf '{"timestamp":"%s","source":"mol-dog-backup","synced":%s,"total":%s}\n' \
+        "$freshness_timestamp" "$SYNCED" "$TOTAL" > "$freshness_tmp"; then
+        rm -f -- "$freshness_tmp"
+        return 1
+    fi
+    if ! chmod 0644 "$freshness_tmp" || ! mv -f -- "$freshness_tmp" "$BACKUP_FRESHNESS_STATE"; then
+        rm -f -- "$freshness_tmp"
+        return 1
     fi
 }
 
@@ -200,7 +223,22 @@ if [ -n "$OFFSITE_PATH" ]; then
     fi
 fi
 
-# --- Step 4: Report ---
+# --- Step 4: Publish the Reaper safety watermark after a complete sync ---
+
+if [ "$FAILED_COUNT" -eq 0 ] && [ "$SYNCED" -eq "$TOTAL" ]; then
+    if ! record_backup_freshness; then
+        dolt_escalate \
+            "Dolt backup: freshness watermark write failed [HIGH]" \
+            "All $TOTAL databases synced, but $BACKUP_FRESHNESS_STATE could not be updated. Reaper bulk pruning remains safely blocked." \
+            2>/dev/null || true
+        SUMMARY="backup — synced: $SYNCED/$TOTAL, freshness: write-failed"
+        dolt_notify_done "$SUMMARY"
+        echo "backup: $SUMMARY"
+        exit 1
+    fi
+fi
+
+# --- Step 5: Report ---
 
 if [ "$FAILED_COUNT" -gt 0 ]; then
     dolt_escalate \

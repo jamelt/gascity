@@ -196,6 +196,12 @@ func ProcessControl(store beads.Store, bead beads.Bead, opts ProcessOptions) (Co
 // teardown or a missing-root orphan close.
 const controlRootCanceledCloseReason = "control closed: workflow root canceled via run cancel"
 
+// workflowDependencySkippedCloseReason is stamped on open workflow members
+// skipped because a terminal top-level dependency failed. The controller closes
+// these members before it closes the failed logical bead, so Beads never gets a
+// window where the closed blocker makes downstream work claimable.
+const workflowDependencySkippedCloseReason = "workflow member skipped: an earlier dependency failed"
+
 // controlRootSettledCloseReason is stamped on a control bead closed because its
 // workflow root had already settled, distinguishing terminal-root residue from
 // a cancellation, a skip teardown, or a missing-root orphan close.
@@ -1363,7 +1369,14 @@ func reconcileTerminalScopedMember(store beads.Store, bead beads.Bead) (ControlR
 func reconcileTerminalScopedMemberWithOptions(store beads.Store, bead beads.Bead, opts ProcessOptions) (ControlResult, error) {
 	scopeRef := bead.Metadata[beadmeta.ScopeRefMetadataKey]
 	if scopeRef == "" {
-		return ControlResult{}, nil
+		if !terminalTopLevelWorkflowFailure(bead) {
+			return ControlResult{}, nil
+		}
+		skipped, err := skipTopLevelWorkflowFailureDependents(store, bead, opts)
+		if err != nil {
+			return ControlResult{}, err
+		}
+		return ControlResult{Processed: true, Action: "workflow-fail", Skipped: skipped}, nil
 	}
 	rootID := bead.Metadata[beadmeta.RootBeadIDMetadataKey]
 	if rootID == "" {
@@ -1412,6 +1425,127 @@ func reconcileTerminalScopedMemberWithOptions(store beads.Store, bead beads.Bead
 		return ControlResult{}, err
 	}
 	return ControlResult{Processed: true, Action: "scope-pass"}, nil
+}
+
+// skipTopLevelWorkflowFailureDependents closes every still-open transitive
+// blocks-dependent of a failed top-level graph member, except the workflow
+// finalizer and the post-settlement teardown tail. Callers on controller-owned
+// logical failures invoke this BEFORE closing the failed bead; the terminal
+// reconciliation path invokes it again after close for idempotent recovery and
+// for worker-owned top-level failures.
+func skipTopLevelWorkflowFailureDependents(store beads.Store, failed beads.Bead, opts ProcessOptions) (int, error) {
+	if strings.TrimSpace(failed.Metadata[beadmeta.ScopeRefMetadataKey]) != "" {
+		return 0, nil
+	}
+	rootID := strings.TrimSpace(failed.Metadata[beadmeta.RootBeadIDMetadataKey])
+	if rootID == "" {
+		return 0, nil
+	}
+	root, err := store.Get(rootID)
+	if err != nil {
+		return 0, fmt.Errorf("%s: loading workflow root %s for failure propagation: %w", failed.ID, rootID, err)
+	}
+	if strings.TrimSpace(root.Metadata[beadmeta.FormulaContractMetadataKey]) != beadmeta.FormulaContractGraphV2 {
+		return 0, nil
+	}
+
+	downstream, err := blockingWorkflowDependents(store, failed.ID, rootID)
+	if err != nil {
+		return 0, fmt.Errorf("%s: resolving failed dependency descendants: %w", failed.ID, err)
+	}
+	if len(downstream) == 0 {
+		return 0, nil
+	}
+	teardown, err := teardownTailExclusion(store, rootID)
+	if err != nil {
+		return 0, fmt.Errorf("%s: resolving teardown members for failure propagation: %w", failed.ID, err)
+	}
+	exclude := func(member beads.Bead) bool {
+		if member.ID == rootID || member.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflowFinalize || teardown(member) {
+			return true
+		}
+		_, shouldSkip := downstream[member.ID]
+		return !shouldSkip
+	}
+	skipped, err := molecule.CloseSubtreeWithMetadataExcept(store, rootID, map[string]string{
+		beadmeta.OutcomeMetadataKey: beadmeta.OutcomeSkipped,
+		"close_reason":              workflowDependencySkippedCloseReason,
+	}, exclude)
+	if err != nil {
+		return skipped, fmt.Errorf("%s: skipping failed dependency descendants: %w", failed.ID, err)
+	}
+	opts.tracef("workflow-fail-propagation bead=%s root=%s downstream=%d skipped=%d", failed.ID, rootID, len(downstream), skipped)
+	return skipped, nil
+}
+
+func skipLogicalWorkflowFailureDependents(store beads.Store, logicalID string, opts ProcessOptions) (int, error) {
+	logical, err := store.Get(logicalID)
+	if err != nil {
+		return 0, fmt.Errorf("loading failed logical bead %s: %w", logicalID, err)
+	}
+	return skipTopLevelWorkflowFailureDependents(store, logical, opts)
+}
+
+func blockingWorkflowDependents(store beads.Store, failedID, rootID string) (map[string]struct{}, error) {
+	downstream := make(map[string]struct{})
+	seen := map[string]struct{}{failedID: {}}
+	queue := []string{failedID}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		deps, err := store.DepList(current, "up")
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range deps {
+			if !beads.IsReadyBlockingDependencyType(dep.Type) {
+				continue
+			}
+			dependentID := strings.TrimSpace(dep.IssueID)
+			if dependentID == "" {
+				continue
+			}
+			if _, ok := seen[dependentID]; ok {
+				continue
+			}
+			dependent, err := store.Get(dependentID)
+			if err != nil {
+				return nil, err
+			}
+			if strings.TrimSpace(dependent.Metadata[beadmeta.RootBeadIDMetadataKey]) != rootID {
+				continue
+			}
+			seen[dependentID] = struct{}{}
+			downstream[dependentID] = struct{}{}
+			queue = append(queue, dependentID)
+		}
+	}
+	return downstream, nil
+}
+
+// terminalTopLevelWorkflowFailure identifies a final, non-attempt failure at
+// workflow scope. Physical retry/Ralph attempts are durable history and must
+// never outvote the logical bead that owns their eventual disposition.
+func terminalTopLevelWorkflowFailure(bead beads.Bead) bool {
+	if bead.Status != "closed" || strings.TrimSpace(bead.Metadata[beadmeta.ScopeRefMetadataKey]) != "" {
+		return false
+	}
+	if isWorkflowAttemptHistory(bead) {
+		return false
+	}
+	return beadOutcomeFailed(bead)
+}
+
+func isWorkflowAttemptHistory(bead beads.Bead) bool {
+	if isRetryAttemptSubject(bead) {
+		return true
+	}
+	// The first attempt is expanded at compile time, before the logical bead
+	// has a durable ID, so it carries gc.attempt + gc.control_for but no
+	// gc.logical_bead_id. Later attempts carry all three. In either shape the
+	// logical control, not this durable attempt record, owns the final outcome.
+	return strings.TrimSpace(bead.Metadata[beadmeta.AttemptMetadataKey]) != "" &&
+		strings.TrimSpace(bead.Metadata[beadmeta.ControlForMetadataKey]) != ""
 }
 
 func resolveBlockingSubjectID(store beads.Store, beadID string) (string, error) {
@@ -1685,7 +1819,7 @@ func resolveFinalizeOutcome(store beads.Store, finalizer beads.Bead) (string, er
 	}
 	rootID := strings.TrimSpace(finalizer.Metadata[beadmeta.RootBeadIDMetadataKey])
 	if outcome == beadmeta.OutcomePass && rootID != "" {
-		failed, err := workflowRootHasTerminalAbortScopeFailure(store, rootID, finalizer.ID)
+		failed, err := workflowRootHasTerminalFailure(store, rootID, finalizer.ID)
 		if err != nil {
 			return "", err
 		}
@@ -1720,7 +1854,7 @@ func resolveBlockedOutcome(store beads.Store, beadID string) (string, error) {
 	return outcome, nil
 }
 
-func workflowRootHasTerminalAbortScopeFailure(store beads.Store, rootID, finalizerID string) (bool, error) {
+func workflowRootHasTerminalFailure(store beads.Store, rootID, finalizerID string) (bool, error) {
 	all, err := beads.DirectMembers(store, rootID)
 	if err != nil {
 		return false, err
@@ -1729,7 +1863,7 @@ func workflowRootHasTerminalAbortScopeFailure(store beads.Store, rootID, finaliz
 		if candidate.ID == finalizerID {
 			continue
 		}
-		if terminalAbortScopeFailure(candidate) {
+		if terminalAbortScopeFailure(candidate) || terminalTopLevelWorkflowFailure(candidate) {
 			return true, nil
 		}
 	}

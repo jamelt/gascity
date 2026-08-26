@@ -950,6 +950,63 @@ func TestNormalizeCanonicalBdScopeFilesForInitPreservesExistingManagedProbeDatab
 	}
 }
 
+func TestScopeCanSeedFreshBdLocalVersionRejectsExistingMigrationEvidence(t *testing.T) {
+	for _, artifact := range []string{"metadata.json", ".local_version", "dolt"} {
+		t.Run(artifact, func(t *testing.T) {
+			scopeRoot := t.TempDir()
+			beadsDir := filepath.Join(scopeRoot, ".beads")
+			if err := os.MkdirAll(beadsDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(beadsDir, artifact)
+			if artifact == "dolt" {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(path, []byte("legacy\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			fresh, err := scopeCanSeedFreshBdLocalVersion(scopeRoot)
+			if err != nil {
+				t.Fatalf("scopeCanSeedFreshBdLocalVersion: %v", err)
+			}
+			if fresh {
+				t.Fatalf("scope with existing %s was classified fresh", artifact)
+			}
+		})
+	}
+}
+
+func TestSeedFreshBdLocalVersionWritesV1LayoutEpochWithoutOverwriting(t *testing.T) {
+	scopeRoot := t.TempDir()
+	beadsDir := filepath.Join(scopeRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := seedFreshBdLocalVersion(scopeRoot, true); err != nil {
+		t.Fatalf("seedFreshBdLocalVersion: %v", err)
+	}
+	versionPath := filepath.Join(beadsDir, ".local_version")
+	if got, err := os.ReadFile(versionPath); err != nil {
+		t.Fatal(err)
+	} else if string(got) != freshBdLocalLayoutVersion+"\n" {
+		t.Fatalf(".local_version = %q, want %q", got, freshBdLocalLayoutVersion+"\n")
+	}
+	if err := os.WriteFile(versionPath, []byte("1.9.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedFreshBdLocalVersion(scopeRoot, true); err != nil {
+		t.Fatalf("seedFreshBdLocalVersion(existing): %v", err)
+	}
+	if got, err := os.ReadFile(versionPath); err != nil {
+		t.Fatal(err)
+	} else if string(got) != "1.9.0\n" {
+		t.Fatalf("existing .local_version overwritten: %q", got)
+	}
+}
+
 // runShHarness runs a generated harness script through sh with the given
 // environment and fails the test if the script itself errors. Shared by the
 // gc-beads-bd harness tests so the untagged subprocess census carries one call
@@ -7252,14 +7309,22 @@ set -eu
 cmd="${1:-}"
 case "$cmd" in
   init)
+    has_reinit=false
     has_force=false
     for arg in "$@"; do
+      if [ "$arg" = "--reinit-local" ]; then
+        has_reinit=true
+      fi
       if [ "$arg" = "--force" ]; then
         has_force=true
       fi
     done
-    if [ "$has_force" != "true" ]; then
-      echo "bd init fallback must force reinitialize existing workspace" >&2
+    if [ "$has_reinit" != "true" ]; then
+      echo "bd init fallback must locally reinitialize existing workspace" >&2
+      exit 2
+    fi
+    if [ "$has_force" = "true" ]; then
+      echo "bd init fallback must not use deprecated --force" >&2
       exit 2
     fi
     printf '1\n' > %q
@@ -7329,7 +7394,7 @@ esac
 		t.Fatalf("expected bd init fallback to run: %v", err)
 	}
 	got := string(data)
-	for _, want := range []string{"--force", "--server", "-p", "gc", "--database", "hq", cityPath} {
+	for _, want := range []string{"--reinit-local", "--server", "-p", "gc", "--database", "hq", cityPath} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("bd init argv missing %q:\n%s", want, got)
 		}
@@ -7583,12 +7648,12 @@ esac
 			t.Fatalf("bd init retry args missing %q:\n%s", want, gotArgs)
 		}
 	}
-	if strings.Contains(gotArgs, "--force") {
+	if strings.Contains(gotArgs, "--reinit-local") || strings.Contains(gotArgs, "--force") {
 		t.Fatalf("post-init schema retry should rerun plain init, got:\n%s", gotArgs)
 	}
 }
 
-func TestGcBeadsBdInitDropsMetadataBeforeRetryingInitAfterForcedFallback(t *testing.T) {
+func TestGcBeadsBdInitDropsMetadataBeforeRetryingInitAfterLocalReinitFallback(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
@@ -7708,7 +7773,7 @@ esac
 	}
 	gotState := string(stateData)
 	for _, want := range []string{
-		"metadata=yes args=init --force --quiet --server -p gc --database hq",
+		"metadata=yes args=init --reinit-local --quiet --server -p gc --database hq",
 		"metadata=no args=init --quiet --server -p gc --database hq",
 	} {
 		if !strings.Contains(gotState, want) {

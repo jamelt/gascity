@@ -2829,6 +2829,13 @@ func setupFreshManagedBdWaitTestCity(t *testing.T) string {
 	t.Setenv("GC_CITY", cityPath)
 	t.Setenv("GC_CITY_PATH", cityPath)
 	materializeBuiltinPacksForTest(t, cityPath)
+	// Production startup seeds canonical metadata and bd's local-layout witness
+	// before launching the managed provider. Keep this direct lifecycle fixture
+	// on the same ordering so a new bd does not classify Gas City's freshly
+	// created Dolt root as an undiscovered legacy workspace.
+	if err := seedDeferredManagedBeadsErr(cityPath, cityPath, "gc", ""); err != nil {
+		t.Fatalf("seedDeferredManagedBeadsErr: %v", err)
+	}
 	if err := ensureBeadsProvider(cityPath); err != nil {
 		t.Fatalf("ensureBeadsProvider: %v", err)
 	}

@@ -41,11 +41,7 @@ export interface AgentPendingSignal {
 // case-insensitively. Aligned with StatusBadge.stateTone and Agents synopsis
 // bucketing so the three readers classify a state the same way.
 const FAILURE_STATES: ReadonlySet<string> = new Set(['failed', 'errored', 'stuck', 'crashed']);
-const RATE_LIMITED_STATES: ReadonlySet<string> = new Set([
-  'rate-limited',
-  'rate_limited',
-  'waiting',
-]);
+const RATE_LIMITED_STATES: ReadonlySet<string> = new Set(['rate-limited', 'rate_limited']);
 
 const ACTION_BY_REASON: Record<AgentNeedsYouReason, AgentNeedsYouAction> = {
   'awaiting-input': 'respond',

@@ -670,8 +670,10 @@ export { stateTone } from '../components/StatusBadge';
 export type SynopsisBucket =
   | 'active'
   | 'idle'
+  | 'waiting'
   | 'detached'
   | 'rate-limited'
+  | 'stopped'
   | 'stuck'
   | 'suspended';
 
@@ -680,13 +682,17 @@ function stateBucket(agent: SupervisorAgent): SynopsisBucket {
   switch (agent.state) {
     case 'active':
     case 'running':
+    case 'working':
       return 'active';
     case 'detached':
       return 'detached';
     case 'rate-limited':
     case 'rate_limited':
-    case 'waiting':
       return 'rate-limited';
+    case 'waiting':
+      return 'waiting';
+    case 'stopped':
+      return 'stopped';
     case 'failed':
     case 'closed':
     case 'errored':
@@ -707,14 +713,18 @@ export function buildAgentSynopsis(rows: ReadonlyArray<SupervisorAgent>): string
   const parts: string[] = [];
   const active = counts.get('active') ?? 0;
   const idle = counts.get('idle') ?? 0;
+  const waiting = counts.get('waiting') ?? 0;
   const detached = counts.get('detached') ?? 0;
   const rateLimited = counts.get('rate-limited') ?? 0;
+  const stopped = counts.get('stopped') ?? 0;
   const stuck = counts.get('stuck') ?? 0;
   const suspended = counts.get('suspended') ?? 0;
   if (active > 0) parts.push(`${active} active`);
   if (idle > 0) parts.push(`${idle} idle`);
+  if (waiting > 0) parts.push(`${waiting} waiting`);
   if (detached > 0) parts.push(`${detached} detached`);
   if (rateLimited > 0) parts.push(`${rateLimited} rate-limited`);
+  if (stopped > 0) parts.push(`${stopped} stopped`);
   if (stuck > 0) parts.push(`${stuck} stuck`);
   if (suspended > 0) parts.push(`${suspended} suspended`);
   return parts.join(', ') + '.';

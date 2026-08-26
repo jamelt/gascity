@@ -1297,8 +1297,8 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		}
 		return Bead{}, fmt.Errorf("getting bead %q: %w", id, ErrNotFound)
 	}
-	var issues []bdIssue
-	if err := json.Unmarshal(extractJSON(out), &issues); err != nil {
+	issues, err := parseBDShowIssues(extractJSON(out))
+	if err != nil {
 		return Bead{}, fmt.Errorf("bd show: parsing JSON: %w", err)
 	}
 	if len(issues) == 0 {
@@ -1319,6 +1319,26 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		return Bead{}, fmt.Errorf("getting bead %q (resolved to %q): %w", id, bead.ID, ErrIDCollision)
 	}
 	return bead, nil
+}
+
+// parseBDShowIssues accepts both machine-output contracts shipped by supported
+// bd versions: older CLIs return a one-element array, while newer CLIs return
+// the issue object directly. List/query decoding remains separate because
+// those commands still use arrays or an {issues:[...]} envelope.
+func parseBDShowIssues(data []byte) ([]bdIssue, error) {
+	var issues []bdIssue
+	arrayErr := json.Unmarshal(data, &issues)
+	if arrayErr == nil {
+		return issues, nil
+	}
+	var issue bdIssue
+	if err := json.Unmarshal(data, &issue); err != nil {
+		return nil, arrayErr
+	}
+	if strings.TrimSpace(issue.ID) == "" {
+		return nil, fmt.Errorf("bd show object has no issue id")
+	}
+	return []bdIssue{issue}, nil
 }
 
 // bdUpdateArgs builds the `bd update` argv for opts, fanning each set field to
