@@ -113,26 +113,25 @@ type RigSweepDeps interface {
 // listOrphanInFlightIdemRecords returns every durable rig-create idempotency
 // record for the city still in state in_flight. At boot the live index is empty
 // (G13 §3.5), so every such record is an orphan whose goroutine did not survive
-// the restart. The lookup is metadata-only (kind+city) with IncludeClosed — the
-// records are closed at birth — then filtered on state in Go.
+// the restart. The dedicated rig-create label narrows the backing query before
+// the city/state metadata predicates are evaluated. This matters on a long-lived
+// Dolt ledger: a metadata-only IncludeClosed query otherwise scans and hydrates
+// the complete history during every supervisor restart. Records are closed at
+// birth, so IncludeClosed remains mandatory.
 func listOrphanInFlightIdemRecords(store beads.Store, city string) ([]beads.Bead, error) {
 	matches, err := store.List(beads.ListQuery{
+		Label: idemLabelRigCreate,
 		Metadata: map[string]string{
-			metaIdemKind: idemKindRigCreate,
-			metaIdemCity: city,
+			metaIdemKind:  idemKindRigCreate,
+			metaIdemCity:  city,
+			metaIdemState: idemStateInFlight,
 		},
 		IncludeClosed: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("listing idem records for %s: %w", city, err)
 	}
-	orphans := matches[:0:0]
-	for i := range matches {
-		if matches[i].Metadata[metaIdemState] == idemStateInFlight {
-			orphans = append(orphans, matches[i])
-		}
-	}
-	return orphans, nil
+	return matches, nil
 }
 
 // SweepOrphanRigProvisions reconciles orphan in_flight rig-create idempotency

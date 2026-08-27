@@ -207,6 +207,54 @@ func seedInFlightRecord(t *testing.T, store beads.Store, city, requestID, rigNam
 	return id
 }
 
+type recordingRigSweepStore struct {
+	beads.Store
+	queries []beads.ListQuery
+}
+
+func (s *recordingRigSweepStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	s.queries = append(s.queries, query)
+	return s.Store.List(query)
+}
+
+// TestSweepOrphanRigProvisionsUsesIndexedLabelQuery prevents the boot sweep
+// from regressing to a JSON-metadata scan across the entire closed ledger. Rig
+// idempotency records carry a dedicated label precisely so startup can narrow
+// the candidate set before applying the city/state metadata predicates.
+func TestSweepOrphanRigProvisionsUsesIndexedLabelQuery(t *testing.T) {
+	backing := beads.NewMemStore()
+	const city = "/city/indexed"
+	seedInFlightRecord(t, backing, city, "req-indexed", "indexed-rig", "")
+	store := &recordingRigSweepStore{Store: backing}
+
+	if err := SweepOrphanRigProvisions(context.Background(), store, city, &fakeSweepDeps{}); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(store.queries) != 1 {
+		t.Fatalf("List calls = %d, want exactly one", len(store.queries))
+	}
+	query := store.queries[0]
+	if query.Label != idemLabelRigCreate {
+		t.Fatalf("List label = %q, want %q", query.Label, idemLabelRigCreate)
+	}
+	if !query.IncludeClosed {
+		t.Fatal("List query omitted closed idempotency records")
+	}
+	wantMetadata := map[string]string{
+		metaIdemKind:  idemKindRigCreate,
+		metaIdemCity:  city,
+		metaIdemState: idemStateInFlight,
+	}
+	if len(query.Metadata) != len(wantMetadata) {
+		t.Fatalf("List metadata = %#v, want %#v", query.Metadata, wantMetadata)
+	}
+	for key, want := range wantMetadata {
+		if got := query.Metadata[key]; got != want {
+			t.Fatalf("List metadata[%q] = %q, want %q", key, got, want)
+		}
+	}
+}
+
 // TestSweepOrphanRigProvisionsDropsThenMarks proves a partial orphan (crash mid
 // provision) is torn down then marked rolled_back — the boot-sweep drop-then-mark.
 func TestSweepOrphanRigProvisionsDropsThenMarks(t *testing.T) {
