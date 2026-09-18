@@ -328,12 +328,6 @@ func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 }
 
 func initDirIfReadyManagedDolt(cityPath, dir, prefix, _ string) error {
-	// Seed canonical metadata and bd's current-layout witness before the
-	// provider creates a local Dolt root. Once that root exists, a missing
-	// witness must be treated as potentially legacy and cannot be inferred.
-	if err := seedDeferredManagedBeadsErr(cityPath, dir, prefix, ""); err != nil {
-		return err
-	}
 	if err := initDirIfReadyEnsureBeadsProvider(cityPath); err != nil {
 		return fmt.Errorf("bead store: %w", err)
 	}
@@ -451,10 +445,6 @@ func seedDeferredManagedBeadsErr(cityPath, dir, prefix, doltDatabase string) err
 	} else if skipsManagedDolt {
 		return nil
 	}
-	freshScope, err := scopeCanSeedFreshBdLocalVersion(dir)
-	if err != nil {
-		return err
-	}
 	if state, ok, err := desiredScopeDoltConfigStateForInit(cityPath, dir, prefix); err != nil {
 		return err
 	} else if ok {
@@ -465,59 +455,7 @@ func seedDeferredManagedBeadsErr(cityPath, dir, prefix, doltDatabase string) err
 	if strings.TrimSpace(doltDatabase) == "" {
 		doltDatabase = readDeferredManagedDoltDatabase(filepath.Join(dir, ".beads", "metadata.json"), defaultScopeDoltDatabase(cityPath, dir, prefix))
 	}
-	if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, dir, doltDatabase); err != nil {
-		return err
-	}
-	return seedFreshBdLocalVersion(dir, freshScope)
-}
-
-// scopeCanSeedFreshBdLocalVersion identifies only a truly new local scope.
-// A missing metadata file by itself is not sufficient: a metadata-less Dolt
-// root can contain legacy data that the bd migration guard must inspect. Gas
-// City may seed the current-layout witness only before either artifact exists.
-func scopeCanSeedFreshBdLocalVersion(scopeRoot string) (bool, error) {
-	for _, path := range []string{
-		filepath.Join(scopeRoot, ".beads", "metadata.json"),
-		filepath.Join(scopeRoot, ".beads", ".local_version"),
-		filepath.Join(scopeRoot, ".beads", "dolt"),
-	} {
-		if _, err := os.Lstat(path); err == nil {
-			return false, nil
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return false, fmt.Errorf("inspect fresh bd scope artifact %s: %w", path, err)
-		}
-	}
-	return true, nil
-}
-
-const freshBdLocalLayoutVersion = "1.0.0"
-
-// seedFreshBdLocalVersion bridges Gas City's pre-seeded server metadata with
-// bd's v1+ legacy-workspace guard. The file is created only for a scope proven
-// fresh before metadata creation; existing and legacy workspaces are never
-// stamped or overwritten. The bootstrap value denotes the v1 local-layout
-// epoch, not a claim about the installed CLI patch version; bd replaces it
-// with its exact version as soon as command setup proceeds past the guard.
-func seedFreshBdLocalVersion(scopeRoot string, fresh bool) error {
-	if !fresh {
-		return nil
-	}
-	path := filepath.Join(scopeRoot, ".beads", ".local_version")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- canonical file beneath the selected scope
-	if errors.Is(err, os.ErrExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("create fresh bd local layout witness: %w", err)
-	}
-	if _, err := io.WriteString(f, freshBdLocalLayoutVersion+"\n"); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("write fresh bd local layout witness: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close fresh bd local layout witness: %w", err)
-	}
-	return nil
+	return ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, dir, doltDatabase)
 }
 
 func readDeferredManagedDoltDatabase(path, fallback string) string {
@@ -667,6 +605,21 @@ func scopeSkipsManagedDoltForInit(cityPath, dir string) (bool, error) {
 		return false, nil
 	}
 	if !samePath(cityPath, dir) {
+		// A scope carrying no metadata of its own has not chosen a backend, so
+		// it inherits the city's — a fact decidable from the city alone. The
+		// authoritative-scope-config path below cannot answer for it: `gc rig
+		// add` writes the rig's .beads/config.yaml only after this gate runs,
+		// so on a fresh rig directory the resolve finds nothing authoritative
+		// and every new rig on a city bound to someone else's store fell
+		// through to managed Dolt — where the add died reaching a Dolt server
+		// that does not exist (gas-4cu).
+		//
+		// This decides dispatch only. The rig is deliberately left unpinned:
+		// an inherited scope resolves the city's binding on each use rather
+		// than carrying a copy that would go stale when the city moves.
+		if !ok && !scopeHasOwnConfigYAML(dir) {
+			return scopeHasCompleteStorageBinding(scopeMetadataJSONPath(cityPath))
+		}
 		resolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, dir, "")
 		if err != nil {
 			return false, err
@@ -680,6 +633,16 @@ func scopeSkipsManagedDoltForInit(cityPath, dir string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// scopeHasOwnConfigYAML reports whether the scope has written its own
+// .beads/config.yaml. A fresh `gc rig add` has not — it writes that file only
+// after this gate runs — so the inheritance shortcut stays scoped to a
+// directory with no config of its own, and a scope that DOES carry one still
+// goes through ResolveScopeConfigState's endpoint-origin validation.
+func scopeHasOwnConfigYAML(dir string) bool {
+	_, err := fsys.OSFS{}.Stat(filepath.Join(dir, ".beads", "config.yaml"))
+	return err == nil
 }
 
 // scopeHasCompleteStorageBinding recognizes the opaque workspace binding
@@ -1026,18 +989,34 @@ func initBeadsForDirWithExecutor(cityPath, dir, prefix, doltDatabase string, exe
 				if isBdAlreadyInitializedError(err) {
 					return finalizeCanonicalBdScopeInit(cityPath, dir, prefix, canonicalDoltDatabase)
 				}
+				reinit := func() error { return execute(script, env, args...) }
 				if shouldRetryExecBdInit(err) {
 					for attempt := 0; attempt < 3; attempt++ {
 						time.Sleep(time.Second)
-						retryErr := execute(script, env, args...)
+						retryErr := reinit()
 						if retryErr == nil {
 							return finalizeCanonicalBdScopeInit(cityPath, dir, prefix, canonicalDoltDatabase)
 						}
-						if !shouldRetryExecBdInit(retryErr) {
-							return retryErr
-						}
 						err = retryErr
+						if !shouldRetryExecBdInit(retryErr) {
+							break
+						}
 					}
+				}
+				// beads refuses to migrate tables with an uncommitted working
+				// set and prescribes a remedy that hits the same refusal. We
+				// created this database, so clear it here instead of handing
+				// the operator that circular advice.
+				if isBdInitDirtyTablesError(err) {
+					if recoverErr := recoverBdInitFromDirtyTables(cityPath, canonicalDoltDatabase, err, reinit); recoverErr != nil {
+						// A re-init that reports the scope is already
+						// initialized succeeded, exactly as it does on the
+						// first attempt above.
+						if !isBdAlreadyInitializedError(recoverErr) {
+							return recoverErr
+						}
+					}
+					return finalizeCanonicalBdScopeInit(cityPath, dir, prefix, canonicalDoltDatabase)
 				}
 				return err
 			}

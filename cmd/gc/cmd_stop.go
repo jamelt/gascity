@@ -77,13 +77,20 @@ type stopCommandOutcome struct {
 }
 
 func cmdStopJSON(args []string, stdout, stderr io.Writer, wallClockTimeout time.Duration, force bool, jsonOut bool) int {
-	unregisterTx := newSupervisorUnregisterTransaction()
 	var outcome stopCommandOutcome
 	if wallClockTimeout > 0 {
+		unregisterTx := newSupervisorUnregisterTransaction()
 		outcome = runStopWithWallClockCap(wallClockTimeout, stderr, unregisterTx, func() stopCommandOutcome {
 			return cmdStopJSONSequence(args, stdout, stderr, force, jsonOut, true, unregisterTx)
 		})
 	} else {
+		// The uncapped path holds the same pending-unregister transaction as
+		// the capped one: a stop that fails after removing the registration —
+		// a managed provider that refuses to shut down, an invalid config the
+		// body cannot recover — must hand the entry back rather than leave a
+		// live city unregistered. This mirrors the capped arm's accept/rollback
+		// exactly; the deferred success message is part of the same contract.
+		unregisterTx := newSupervisorUnregisterTransaction()
 		outcome = cmdStopJSONSequence(args, stdout, stderr, force, jsonOut, false, unregisterTx)
 		if outcome.code == 0 {
 			unregisterTx.commit()
@@ -147,7 +154,7 @@ func cmdStopJSONSequence(args []string, stdout, stderr io.Writer, force bool, js
 	if wallClockCapApplied {
 		return stopLoadedCity()
 	}
-	return runStopWithWallClockCap(defaultStopWallClockTimeout(cfg), stderr, unregisterTx, stopLoadedCity)
+	return runStopWithWallClockCap(defaultStopWallClockTimeout(cfg), stderr, nil, stopLoadedCity)
 }
 
 func runStopWithWallClockCap(wallClockCap time.Duration, stderr io.Writer, unregisterTx *supervisorUnregisterTransaction, stop func() stopCommandOutcome) stopCommandOutcome {

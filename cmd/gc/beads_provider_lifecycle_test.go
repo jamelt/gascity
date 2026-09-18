@@ -950,63 +950,6 @@ func TestNormalizeCanonicalBdScopeFilesForInitPreservesExistingManagedProbeDatab
 	}
 }
 
-func TestScopeCanSeedFreshBdLocalVersionRejectsExistingMigrationEvidence(t *testing.T) {
-	for _, artifact := range []string{"metadata.json", ".local_version", "dolt"} {
-		t.Run(artifact, func(t *testing.T) {
-			scopeRoot := t.TempDir()
-			beadsDir := filepath.Join(scopeRoot, ".beads")
-			if err := os.MkdirAll(beadsDir, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			path := filepath.Join(beadsDir, artifact)
-			if artifact == "dolt" {
-				if err := os.Mkdir(path, 0o700); err != nil {
-					t.Fatal(err)
-				}
-			} else if err := os.WriteFile(path, []byte("legacy\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-
-			fresh, err := scopeCanSeedFreshBdLocalVersion(scopeRoot)
-			if err != nil {
-				t.Fatalf("scopeCanSeedFreshBdLocalVersion: %v", err)
-			}
-			if fresh {
-				t.Fatalf("scope with existing %s was classified fresh", artifact)
-			}
-		})
-	}
-}
-
-func TestSeedFreshBdLocalVersionWritesV1LayoutEpochWithoutOverwriting(t *testing.T) {
-	scopeRoot := t.TempDir()
-	beadsDir := filepath.Join(scopeRoot, ".beads")
-	if err := os.MkdirAll(beadsDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := seedFreshBdLocalVersion(scopeRoot, true); err != nil {
-		t.Fatalf("seedFreshBdLocalVersion: %v", err)
-	}
-	versionPath := filepath.Join(beadsDir, ".local_version")
-	if got, err := os.ReadFile(versionPath); err != nil {
-		t.Fatal(err)
-	} else if string(got) != freshBdLocalLayoutVersion+"\n" {
-		t.Fatalf(".local_version = %q, want %q", got, freshBdLocalLayoutVersion+"\n")
-	}
-	if err := os.WriteFile(versionPath, []byte("1.9.0\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := seedFreshBdLocalVersion(scopeRoot, true); err != nil {
-		t.Fatalf("seedFreshBdLocalVersion(existing): %v", err)
-	}
-	if got, err := os.ReadFile(versionPath); err != nil {
-		t.Fatal(err)
-	} else if string(got) != "1.9.0\n" {
-		t.Fatalf("existing .local_version overwritten: %q", got)
-	}
-}
-
 // runShHarness runs a generated harness script through sh with the given
 // environment and fails the test if the script itself errors. Shared by the
 // gc-beads-bd harness tests so the untagged subprocess census carries one call
@@ -4201,6 +4144,15 @@ func TestInitBeadsForDirBuildsCanonicalBdInitProviderOp(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cityDir := t.TempDir()
+			pinnedBD := filepath.Join(t.TempDir(), "bd")
+			if err := os.WriteFile(pinnedBD, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// Fresh gc init reaches this provider operation before it can
+			// persist workspace.env. The process-scoped pin must still reach
+			// the lifecycle script so initialization cannot select an ambient
+			// schema-incompatible bd.
+			t.Setenv("BD_BIN", pinnedBD)
 			cityConfig := fmt.Sprintf(`[workspace]
 name = "demo"
 
@@ -4244,6 +4196,7 @@ provider = %q
 				"GC_PACK_STATE_DIR":   citylayout.PackStateDir(cityDir, "dolt"),
 				"GC_DOLT_DATA_DIR":    filepath.Join(cityDir, ".beads", "dolt"),
 				"BEADS_DIR":           filepath.Join(cityDir, ".beads"),
+				"BD_BIN":              pinnedBD,
 			} {
 				if got := env[key]; got != want {
 					t.Errorf("%s = %q, want %q", key, got, want)
@@ -7279,6 +7232,16 @@ esac
 	}
 }
 
+func runGcBeadsBdHQInitForTest(t *testing.T, script, cityPath, binDir string) ([]byte, error) {
+	t.Helper()
+	cmd := exec.Command(script, "init", cityPath, "gc", "hq")
+	cmd.Env = sanitizedBaseEnv(append(gcBeadsBdTestHomeEnv(t),
+		"GC_CITY_PATH="+cityPath,
+		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
+	)...)
+	return cmd.CombinedOutput()
+}
+
 func TestGcBeadsBdInitMetadataOnlyFallsThroughToForcedBdInitWithPinnedDatabaseWhenSchemaMissing(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
@@ -7302,29 +7265,30 @@ func TestGcBeadsBdInitMetadataOnlyFallsThroughToForcedBdInitWithPinnedDatabaseWh
 
 	initArgsFile := filepath.Join(t.TempDir(), "bd-init-args")
 	initCountFile := filepath.Join(t.TempDir(), "bd-init-count")
+	databaseCreatedFile := filepath.Join(t.TempDir(), "database-created")
 	sqlLogFile := filepath.Join(t.TempDir(), "dolt-sql-args")
 	fakeBd := filepath.Join(binDir, "bd")
 	fakeBdScript := fmt.Sprintf(`#!/bin/sh
 set -eu
 cmd="${1:-}"
 case "$cmd" in
+  --version|version)
+    echo "bd version 1.2.1 (test)"
+    exit 0
+    ;;
   init)
-    has_reinit=false
+    if [ "$(cat "$BEADS_DIR/.local_version" 2>/dev/null || true)" != "1.2.1" ]; then
+      echo "legacy Dolt server workspace detected; explicit migration is required" >&2
+      exit 3
+    fi
     has_force=false
     for arg in "$@"; do
-      if [ "$arg" = "--reinit-local" ]; then
-        has_reinit=true
-      fi
       if [ "$arg" = "--force" ]; then
         has_force=true
       fi
     done
-    if [ "$has_reinit" != "true" ]; then
-      echo "bd init fallback must locally reinitialize existing workspace" >&2
-      exit 2
-    fi
-    if [ "$has_force" = "true" ]; then
-      echo "bd init fallback must not use deprecated --force" >&2
+    if [ "$has_force" != "true" ]; then
+      echo "bd init fallback must force reinitialize existing workspace" >&2
       exit 2
     fi
     printf '1\n' > %q
@@ -7357,6 +7321,12 @@ for arg in "$@"; do
 done
 printf '%%s\n' "$query" >> %q
 case "$query" in
+  'USE `+"`hq`"+`')
+    [ -f %q ]
+    ;;
+  'CREATE DATABASE IF NOT EXISTS `+"`hq`"+`')
+    : > %q
+    ;;
   'USE `+"`hq`"+`; SELECT 1 FROM config LIMIT 1')
     if [ ! -f %q ]; then
       echo "table not found: config" >&2
@@ -7374,17 +7344,12 @@ case "$query" in
     exit 0
     ;;
 esac
-`, sqlLogFile, initCountFile)
+`, sqlLogFile, databaseCreatedFile, databaseCreatedFile, initCountFile)
 	if err := os.WriteFile(fakeDolt, []byte(fakeDoltScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(script, "init", cityPath, "gc", "hq")
-	cmd.Env = sanitizedBaseEnv(append(gcBeadsBdTestHomeEnv(t),
-		"GC_CITY_PATH="+cityPath,
-		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
-	)...)
-	out, err := cmd.CombinedOutput()
+	out, err := runGcBeadsBdHQInitForTest(t, script, cityPath, binDir)
 	if err != nil {
 		t.Fatalf("gc-beads-bd init failed: %v\n%s", err, out)
 	}
@@ -7394,13 +7359,152 @@ esac
 		t.Fatalf("expected bd init fallback to run: %v", err)
 	}
 	got := string(data)
-	for _, want := range []string{"--reinit-local", "--server", "-p", "gc", "--database", "hq", cityPath} {
+	for _, want := range []string{"--force", "--server", "-p", "gc", "--database", "hq", cityPath} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("bd init argv missing %q:\n%s", want, got)
 		}
 	}
 	if strings.Contains(got, "-p hq") {
 		t.Fatalf("bd init should keep visible prefix gc while pinning database hq:\n%s", got)
+	}
+	versionData, err := os.ReadFile(filepath.Join(cityPath, ".beads", ".local_version"))
+	if err != nil {
+		t.Fatalf("read fresh managed-Dolt version witness: %v", err)
+	}
+	if got := strings.TrimSpace(string(versionData)); got != "1.2.1" {
+		t.Fatalf("fresh managed-Dolt version witness = %q, want %q", got, "1.2.1")
+	}
+}
+
+// TestGcBeadsBdInitDoesNotSeedVersionWitnessForAdoptedPreExistingDatabase is the
+// mirror of the fresh-path test above: the backing store already exists on disk
+// but the running server has not cataloged it, so CREATE DATABASE IF NOT EXISTS
+// adopts it rather than creating it. Adoption must not be mistaken for
+// freshness — seeding a version witness there would bypass bd's explicit
+// cross-era migration guard, which must still fire.
+func TestGcBeadsBdInitDoesNotSeedVersionWitnessForAdoptedPreExistingDatabase(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The pre-existing backing store: GC_DOLT_DATA_DIR is unset, so the script
+	// resolves DATA_DIR to $cityPath/.beads/dolt.
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads", "dolt", "hq"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"),
+		[]byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	materializeBuiltinPacksForTest(t, cityPath)
+	script := gcBeadsBdScriptPath(cityPath)
+
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	initArgsFile := filepath.Join(t.TempDir(), "bd-init-args")
+	initCountFile := filepath.Join(t.TempDir(), "bd-init-count")
+	databaseCreatedFile := filepath.Join(t.TempDir(), "database-created")
+	sqlLogFile := filepath.Join(t.TempDir(), "dolt-sql-args")
+	fakeBd := filepath.Join(binDir, "bd")
+	fakeBdScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+cmd="${1:-}"
+case "$cmd" in
+  --version|version)
+    echo "bd version 1.2.1 (test)"
+    exit 0
+    ;;
+  init)
+    if [ "$(cat "$BEADS_DIR/.local_version" 2>/dev/null || true)" != "1.2.1" ]; then
+      echo "legacy Dolt server workspace detected; explicit migration is required" >&2
+      exit 3
+    fi
+    has_force=false
+    for arg in "$@"; do
+      if [ "$arg" = "--force" ]; then
+        has_force=true
+      fi
+    done
+    if [ "$has_force" != "true" ]; then
+      echo "bd init fallback must force reinitialize existing workspace" >&2
+      exit 2
+    fi
+    printf '1\n' > %q
+    printf '%%s\n' "$@" > %q
+    exit 0
+    ;;
+  config|migrate|list)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, initCountFile, initArgsFile)
+	if err := os.WriteFile(fakeBd, []byte(fakeBdScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeDolt := filepath.Join(binDir, "dolt")
+	fakeDoltScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+query=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-q" ]; then
+    query="$arg"
+    break
+  fi
+  prev="$arg"
+done
+printf '%%s\n' "$query" >> %q
+case "$query" in
+  'USE `+"`hq`"+`')
+    [ -f %q ]
+    ;;
+  'CREATE DATABASE IF NOT EXISTS `+"`hq`"+`')
+    : > %q
+    ;;
+  'USE `+"`hq`"+`; SELECT 1 FROM config LIMIT 1')
+    if [ ! -f %q ]; then
+      echo "table not found: config" >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''types.custom'\'', '\''molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
+    exit 0
+    ;;
+  'USE `+"`hq`"+`; INSERT INTO config (`+"`key`"+`, value) VALUES ('\''issue_prefix'\'', '\''gc'\'') ON DUPLICATE KEY UPDATE value = VALUES(value)')
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, sqlLogFile, databaseCreatedFile, databaseCreatedFile, initCountFile)
+	if err := os.WriteFile(fakeDolt, []byte(fakeDoltScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runGcBeadsBdHQInitForTest(t, script, cityPath, binDir)
+	if err == nil {
+		t.Fatalf("gc-beads-bd init should surface bd's legacy-workspace guard for an adopted pre-existing database:\n%s", out)
+	}
+	if !strings.Contains(string(out), "legacy Dolt server workspace detected") {
+		t.Fatalf("expected bd's legacy-migration guard to fire:\n%s", out)
+	}
+
+	witness := filepath.Join(cityPath, ".beads", ".local_version")
+	if _, statErr := os.Stat(witness); !os.IsNotExist(statErr) {
+		t.Fatalf("adopted pre-existing database must not receive a bd version witness at %s (stat err = %v)", witness, statErr)
 	}
 }
 
@@ -7648,12 +7752,12 @@ esac
 			t.Fatalf("bd init retry args missing %q:\n%s", want, gotArgs)
 		}
 	}
-	if strings.Contains(gotArgs, "--reinit-local") || strings.Contains(gotArgs, "--force") {
+	if strings.Contains(gotArgs, "--force") {
 		t.Fatalf("post-init schema retry should rerun plain init, got:\n%s", gotArgs)
 	}
 }
 
-func TestGcBeadsBdInitDropsMetadataBeforeRetryingInitAfterLocalReinitFallback(t *testing.T) {
+func TestGcBeadsBdInitDropsMetadataBeforeRetryingInitAfterForcedFallback(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
@@ -7773,7 +7877,7 @@ esac
 	}
 	gotState := string(stateData)
 	for _, want := range []string{
-		"metadata=yes args=init --reinit-local --quiet --server -p gc --database hq",
+		"metadata=yes args=init --force --quiet --server -p gc --database hq",
 		"metadata=no args=init --quiet --server -p gc --database hq",
 	} {
 		if !strings.Contains(gotState, want) {
@@ -12172,5 +12276,61 @@ func TestDefaultScopeDoltDatabase(t *testing.T) {
 				t.Errorf("defaultScopeDoltDatabase(%q, %q, %q) = %q starts with a digit; Dolt rejects digit-leading database names", cityPath, tt.dir, tt.prefix, got)
 			}
 		})
+	}
+}
+
+// The first init attempt already treats "already initialized" as success. A
+// post-commit re-init that reports the same thing means the recovery worked, so
+// it must not turn a recovered rig into a hard `gc rig add` failure.
+func TestInitBeadsForDirWithExecutorTreatsAlreadyInitializedRecoveryAsSuccess(t *testing.T) {
+	cityDir := t.TempDir()
+	cleanupManagedDoltTestCity(t, cityDir)
+	cityConfig := `[workspace]
+name = "demo"
+
+[beads]
+provider = "bd"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rigDir := filepath.Join(cityDir, "rigs", "gascity-packs")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var commits int
+	stubCommitDirtyScopeTables(t, func(string, string) (bool, error) {
+		commits++
+		return true, nil
+	})
+
+	alreadyErr := errors.New("bd init: already initialized")
+	var calls int
+	execute := func(_ string, _ []string, _ ...string) error {
+		calls++
+		if calls == 1 {
+			return errors.New(bdDirtyTablesErrText)
+		}
+		return alreadyErr
+	}
+
+	// doltDatabase is deliberately overridden to a beads_test_-prefixed name
+	// (rather than the "gsp" a real gascity-packs rig would use) because
+	// this test exercises the real finalizeCanonicalBdScopeInit success path
+	// (it opens a real store — see initBeadsForDirWithExecutor's
+	// isBdAlreadyInitializedError branch), which the fake execute above
+	// never touches. The prefix keeps that store identifiable and reapable
+	// by defaultStaleDatabasePrefixes (ga-szv0ge) instead of colliding with
+	// production "gsp" naming.
+	err := initBeadsForDirWithExecutor(cityDir, rigDir, "gsp", "beads_test_gsp", execute)
+	if errors.Is(err, alreadyErr) {
+		t.Fatalf("initBeadsForDirWithExecutor error = %v, want the recovery to be treated as success", err)
+	}
+	if calls != 2 {
+		t.Fatalf("bd init attempts = %d, want 2 (initial + post-commit retry)", calls)
+	}
+	if commits != 1 {
+		t.Fatalf("commit rounds = %d, want 1", commits)
 	}
 }
