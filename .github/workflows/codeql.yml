@@ -10,8 +10,6 @@ on:
       - reopened
       - synchronize
       - ready_for_review
-  schedule:
-    - cron: "24 4 * * 1"
   workflow_dispatch:
 
 permissions:

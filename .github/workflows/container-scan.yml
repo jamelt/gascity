@@ -44,8 +44,6 @@ on:
       - "deps.env"
       - "go.mod"
       - "go.sum"
-  schedule:
-    - cron: "43 6 * * 3"
   workflow_dispatch:
 
 permissions:
