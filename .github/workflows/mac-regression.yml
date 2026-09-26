@@ -56,8 +56,6 @@ on:
         description: Pull request head ref for label-dispatched runs
         required: false
         type: string
-  schedule:
-    - cron: "17 3 * * *"
   pull_request:
     branches: [main]
     types:

@@ -32,10 +32,6 @@ on:
       - reopened
       - synchronize
       - ready_for_review
-  schedule:
-    # Daily, because the most common way a finding appears is a newly published
-    # advisory against code that already shipped -- no repository change involved.
-    - cron: "19 7 * * *"
   workflow_dispatch:
 
 permissions:
